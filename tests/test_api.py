@@ -857,3 +857,90 @@ def test_update_rule_errors(client):
 
     toggle_not_found = client.post("/rules/00000000-0000-0000-0000-000000000999/toggle")
     assert toggle_not_found.status_code == 404
+
+
+def test_simulate_rule_match(client):
+    group = GroupFixture(id="00000000-0000-0000-0000-00000000f001", name="group-f")
+    rule = RuleFixture(
+        id="00000000-0000-0000-0000-000000000401",
+        rule_name="simulate-rule",
+        condition_json={"source": "prometheus", "severity": "CRITICAL"},
+        recipient_group_id=group.id,
+        channels=["voice"],
+        active=True,
+        priority=1,
+        requires_ack=False,
+        ack_deadline=None,
+        fallback_policy_json=None,
+    )
+    fake_session = FakeRuleSession([rule], [group])
+    main.app.dependency_overrides[main.get_db] = lambda: fake_session
+
+    response = client.post(
+        f"/rules/{rule.id}/simulate",
+        json={"source": "prometheus", "severity": "CRITICAL", "host": "db01"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["rule_id"] == rule.id
+    assert payload["matched"] is True
+    assert payload["reasons"] == []
+    assert payload["payload"]["host"] == "db01"
+
+
+def test_simulate_rule_no_match(client):
+    group = GroupFixture(id="00000000-0000-0000-0000-00000000f002", name="group-g")
+    rule = RuleFixture(
+        id="00000000-0000-0000-0000-000000000402",
+        rule_name="simulate-rule-2",
+        condition_json={"source": "prometheus", "severity": "CRITICAL"},
+        recipient_group_id=group.id,
+        channels=["voice"],
+        active=True,
+        priority=1,
+        requires_ack=False,
+        ack_deadline=None,
+        fallback_policy_json=None,
+    )
+    fake_session = FakeRuleSession([rule], [group])
+    main.app.dependency_overrides[main.get_db] = lambda: fake_session
+
+    response = client.post(
+        f"/rules/{rule.id}/simulate",
+        json={"source": "grafana", "severity": "WARN"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["matched"] is False
+    assert len(payload["reasons"]) == 2
+    assert any("source" in reason for reason in payload["reasons"])
+    assert any("severity" in reason for reason in payload["reasons"])
+
+
+def test_simulate_rule_errors(client):
+    group = GroupFixture(id="00000000-0000-0000-0000-00000000f003", name="group-h")
+    rule = RuleFixture(
+        id="00000000-0000-0000-0000-000000000403",
+        rule_name="simulate-rule-3",
+        condition_json={"source": "prometheus"},
+        recipient_group_id=group.id,
+        channels=["voice"],
+        active=True,
+        priority=1,
+        requires_ack=False,
+        ack_deadline=None,
+        fallback_policy_json=None,
+    )
+    fake_session = FakeRuleSession([rule], [group])
+    main.app.dependency_overrides[main.get_db] = lambda: fake_session
+
+    invalid = client.post("/rules/not-a-uuid/simulate", json={"source": "prometheus"})
+    assert invalid.status_code == 400
+
+    not_found = client.post(
+        "/rules/00000000-0000-0000-0000-000000000999/simulate",
+        json={"source": "prometheus"},
+    )
+    assert not_found.status_code == 404

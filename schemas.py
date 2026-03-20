@@ -52,6 +52,14 @@ class RuleCreate(BaseModel):
 class RuleResponse(RuleCreate):
     id: uuid.UUID
 
+class RuleSimulationResponse(BaseModel):
+    rule_id: uuid.UUID
+    rule_name: str
+    matched: bool
+    reasons: List[str] = Field(default_factory=list)
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    condition_json: Dict[str, Any] = Field(default_factory=dict)
+
 class RuleUpdate(BaseModel):
     rule_name: Optional[str] = None
     condition_json: Optional[Dict[str, Any]] = None

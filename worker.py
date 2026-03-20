@@ -1,4 +1,5 @@
 import json
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -17,6 +18,8 @@ from .config import (
     DLQ_REPLAY_INTERVAL_SECONDS,
     CB_FAILURE_THRESHOLD,
     CB_OPEN_SECONDS,
+    CHANNEL_RATE_LIMIT_PER_MINUTE,
+    CHANNEL_RATE_LIMIT_WINDOW_SECONDS,
     CELERY_TASK_MAX_RETRIES,
     CELERY_TASK_RETRY_BACKOFF,
     CELERY_TASK_RETRY_BACKOFF_MAX,
@@ -110,6 +113,17 @@ def _channel_circuit_failure_key(channel: NotificationChannel | str) -> str:
     return prefixed_redis_key(f"cb:{_channel_name(channel).lower()}:failures")
 
 
+def _channel_rate_limit_key(
+    channel: NotificationChannel | str,
+    window_seconds: int | None = None,
+    now_epoch: int | None = None,
+) -> str:
+    window = CHANNEL_RATE_LIMIT_WINDOW_SECONDS if window_seconds is None else max(1, int(window_seconds))
+    epoch = int(time.time()) if now_epoch is None else int(now_epoch)
+    bucket = epoch // window
+    return prefixed_redis_key(f"rl:{_channel_name(channel).lower()}:{bucket}")
+
+
 def _channel_is_circuit_open(channel: NotificationChannel | str) -> bool:
     return bool(redis_conn.exists(_channel_circuit_open_key(channel)))
 
@@ -139,6 +153,34 @@ def _record_channel_failure(channel: NotificationChannel | str) -> dict[str, int
         }
     )
     return {"channel": channel_name, "failures": failures, "opened": opened}
+
+
+def _channel_rate_limit_exceeded(
+    channel: NotificationChannel | str,
+    limit_per_minute: int | None = None,
+    window_seconds: int | None = None,
+    now_epoch: int | None = None,
+) -> dict[str, int | bool | str]:
+    limit = CHANNEL_RATE_LIMIT_PER_MINUTE if limit_per_minute is None else max(1, int(limit_per_minute))
+    window = CHANNEL_RATE_LIMIT_WINDOW_SECONDS if window_seconds is None else max(1, int(window_seconds))
+    key = _channel_rate_limit_key(channel, window_seconds=window, now_epoch=now_epoch)
+    count = redis_conn.incr(key)
+    if count == 1:
+        redis_conn.expire(key, window)
+    exceeded = count > limit
+    _touch_metrics(
+        {
+            f"rate_limit_count:{_channel_name(channel).lower()}": count,
+            f"rate_limit_exceeded:{_channel_name(channel).lower()}": int(exceeded),
+        }
+    )
+    return {
+        "channel": _channel_name(channel),
+        "limit": limit,
+        "count": count,
+        "window_seconds": window,
+        "exceeded": exceeded,
+    }
 
 
 def _metric_timestamp() -> str:
@@ -430,16 +472,63 @@ def _send_notification_channel_impl(
     provider_channel: NotificationChannel | str,
 ):
     channel_name = _channel_name(provider_channel)
-    if channel_name in {"VOICE", "TELEGRAM", "EMAIL"} and _channel_is_circuit_open(channel_name):
-        return {
-            "status": "skipped_circuit",
-            "channel": channel_name,
-            "notification_id": notification_id,
-            "trace_id": trace_id,
-        }
-
     db: Session = SessionLocal()
     try:
+        notification = (
+            db.query(Notification)
+            .filter(Notification.id == notification_id)
+            .with_for_update()
+            .first()
+        )
+        if not notification:
+            raise LookupError(f"notification not found: {notification_id}")
+        if _notification_is_terminal(notification):
+            return {
+                "status": "already_terminal",
+                "channel": channel_name,
+                "notification_id": notification_id,
+                "trace_id": trace_id,
+            }
+
+        if channel_name in {"VOICE", "TELEGRAM", "EMAIL"} and _channel_is_circuit_open(channel_name):
+            return {
+                "status": "skipped_circuit",
+                "channel": channel_name,
+                "notification_id": notification_id,
+                "trace_id": trace_id,
+            }
+
+        rate_limit = None
+        if channel_name in {"VOICE", "TELEGRAM", "EMAIL"}:
+            rate_limit = _channel_rate_limit_exceeded(channel_name)
+            if rate_limit["exceeded"]:
+                db.add(
+                    AuditLog(
+                        trace_id=trace_id,
+                        incident_id=notification.incident_id,
+                        action=AuditAction.FAILED,
+                        details_json={
+                            "channel": channel_name,
+                            "notification_id": notification_id,
+                            "reason": "rate_limited",
+                            "limit": rate_limit["limit"],
+                            "count": rate_limit["count"],
+                            "window_seconds": rate_limit["window_seconds"],
+                        },
+                    )
+                )
+                db.commit()
+
+                # We record rate-limited deliveries as FAILED because the task did not emit the message.
+                _increment_metric_counter("tasks_failed_by_channel", channel_name)
+                return {
+                    "status": "skipped_rate_limit",
+                    "channel": channel_name,
+                    "notification_id": notification_id,
+                    "trace_id": trace_id,
+                    "rate_limit": rate_limit,
+                }
+
         sent = _mark_notification_sent(db, notification_id, trace_id, channel_name)
         if sent:
             return {

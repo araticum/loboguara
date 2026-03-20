@@ -75,6 +75,25 @@ def _serialize_rule(rule: models.Rule) -> schemas.RuleResponse:
         fallback_policy_json=rule.fallback_policy_json,
     )
 
+def _simulate_rule(rule: models.Rule, payload: dict[str, object]) -> schemas.RuleSimulationResponse:
+    reasons: list[str] = []
+    for key, expected_value in rule.condition_json.items():
+        actual_value = payload.get(key, None)
+        if actual_value != expected_value:
+            reasons.append(
+                f"{key}: expected {expected_value!r}, got {actual_value!r}"
+            )
+
+    matched = len(reasons) == 0
+    return schemas.RuleSimulationResponse(
+        rule_id=rule.id,
+        rule_name=rule.rule_name,
+        matched=matched,
+        reasons=reasons,
+        payload=payload,
+        condition_json=rule.condition_json,
+    )
+
 def _get_or_create_trace_id(db: Session, incident_id: uuid.UUID) -> str:
     first_log = (
         db.query(models.AuditLog)
@@ -558,6 +577,23 @@ def toggle_rule(rule_id: str, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(db_rule)
     return _serialize_rule(db_rule)
+
+@app.post("/rules/{rule_id}/simulate", response_model=schemas.RuleSimulationResponse)
+def simulate_rule(
+    rule_id: str,
+    payload: dict[str, object],
+    db: Session = Depends(get_db),
+):
+    try:
+        rule_uuid = uuid.UUID(rule_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid rule id") from exc
+
+    db_rule = db.query(models.Rule).filter(models.Rule.id == rule_uuid).first()
+    if not db_rule:
+        raise HTTPException(status_code=404, detail="Rule not found")
+
+    return _simulate_rule(db_rule, payload)
 
 @app.post("/groups", response_model=schemas.GroupResponse)
 def create_group(group: schemas.GroupCreate, db: Session = Depends(get_db)):
