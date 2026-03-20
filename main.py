@@ -8,11 +8,9 @@ from .database import get_db
 from .redis_client import is_duplicate
 from .engine import evaluate_rules
 from .worker import dispatch_incident
-import os
+from .config import APP_BASE_URL, queue_name
 
 app = FastAPI(title="Event SaaS API", version="0.1.0")
-
-APP_BASE_URL = os.getenv("APP_BASE_URL", "https://api.event-saas.com")
 
 def _serialize_incident(incident: models.Incident) -> schemas.IncidentResponse:
     return schemas.IncidentResponse(
@@ -131,7 +129,10 @@ def ingest_event(event: schemas.EventIncoming, db: Session = Depends(get_db)):
     db.commit()
     
     if matched_rule:
-        dispatch_incident.apply_async(args=(str(incident.id), audit_trace_id), queue="queue:dispatch")
+        dispatch_incident.apply_async(
+            args=(str(incident.id), audit_trace_id),
+            queue=queue_name("dispatch"),
+        )
         
     return schemas.EventIngestResponse(
         status="accepted",

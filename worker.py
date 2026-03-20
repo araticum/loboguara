@@ -1,4 +1,3 @@
-import os
 from celery import Celery
 from sqlalchemy.orm import Session
 from .database import SessionLocal
@@ -14,8 +13,8 @@ from .models import (
     AuditAction,
 )
 from .redis_client import acquire_idempotency_key
+from .config import REDIS_URL, queue_name
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 celery_app = Celery("event_saas", broker=REDIS_URL, backend=REDIS_URL)
 
 celery_app.conf.update(
@@ -25,9 +24,9 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
     task_routes={
-        "dispatcher": {"queue": "queue:dispatch"},
-        "voice_worker": {"queue": "queue:voice"},
-        "escalation_worker": {"queue": "queue:escalation"},
+        "dispatcher": {"queue": queue_name("dispatch")},
+        "voice_worker": {"queue": queue_name("voice")},
+        "escalation_worker": {"queue": queue_name("escalation")},
     },
 )
 
@@ -77,7 +76,10 @@ def dispatch_incident(incident_id: str, incoming_trace_id: str):
             db.add(audit)
             
             if notif.channel == NotificationChannel.VOICE:
-                send_voice_call.apply_async(args=(str(notif.id), incoming_trace_id), queue="queue:voice")
+                send_voice_call.apply_async(
+                    args=(str(notif.id), incoming_trace_id),
+                    queue=queue_name("voice"),
+                )
             elif notif.channel == NotificationChannel.TELEGRAM:
                 # TODO: implementar worker dedicado
                 continue
@@ -92,7 +94,7 @@ def dispatch_incident(incident_id: str, incoming_trace_id: str):
             handle_escalation.apply_async(
                 args=(incident_id, incoming_trace_id),
                 countdown=rule.ack_deadline,
-                queue="queue:escalation",
+                queue=queue_name("escalation"),
             )
             
     finally:
@@ -171,6 +173,9 @@ def handle_escalation(incident_id: str, trace_id: str):
                             db.commit()
                             
                             if normalized == "VOICE":
-                                send_voice_call.apply_async(args=(str(notif.id), trace_id), queue="queue:voice")
+                                send_voice_call.apply_async(
+                                    args=(str(notif.id), trace_id),
+                                    queue=queue_name("voice"),
+                                )
     finally:
         db.close()

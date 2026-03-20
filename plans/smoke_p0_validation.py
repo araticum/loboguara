@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 
 os.environ["DATABASE_URL"] = "postgresql://postgres:postgres@localhost:55432/eventsaas"
 os.environ["REDIS_URL"] = "redis://localhost:56379/0"
+os.environ["SERIEMA_DB_SCHEMA"] = "seriema"
+os.environ["SERIEMA_REDIS_DB"] = "5"
 os.environ["APP_BASE_URL"] = "http://testserver"
 
 sys.path.insert(0, r"D:\Repo")
