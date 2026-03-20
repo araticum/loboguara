@@ -436,6 +436,46 @@ def test_replay_dlq_dry_run_does_not_remove_items(monkeypatch):
     assert result["candidates"] and result["candidates"][0]["notification_id"] == "notification-1"
 
 
+def test_replay_dlq_persists_report_on_success(monkeypatch):
+    prefix = f"pytest:{uuid.uuid4().hex}"
+    _, redis_client, worker = _fresh_worker(monkeypatch, prefix=prefix, dry_run="false")
+
+    _clear_prefix(redis_client.redis_conn, prefix)
+
+    redis_client.redis_conn.rpush(
+        worker.DLQ_REDIS_KEY,
+        json.dumps(
+            {
+                "task_name": "voice_worker",
+                "args": ["notification-normal", "trace-normal"],
+                "kwargs": {},
+                "trace_id": "trace-normal",
+                "notification_id": "notification-normal",
+                "incident_id": "incident-normal",
+                "error": "boom",
+                "failed_at": "fixed-normal",
+            }
+        ),
+    )
+    monkeypatch.setattr(worker, "_replay_entry", lambda entry: True)
+
+    result = worker.replay_dlq(limit=1)
+    report = redis_client.redis_conn.hgetall(worker.DLQ_REPLAY_REPORT_KEY)
+
+    assert result["status"] == "completed"
+    assert result["replayed"] == 1
+    assert result["remaining"] == 0
+    assert report[b"status"] == b"completed"
+    assert report[b"requested_limit"] == b"1"
+    assert report[b"effective_limit"] == b"1"
+    assert report[b"replayed"] == b"1"
+    assert report[b"remaining"] == b"0"
+    assert report[b"dry_run"] == b"0"
+    assert report[b"locked"] == b"0"
+    assert b"started_at" in report
+    assert b"finished_at" in report
+
+
 def test_replay_dlq_ignores_invalid_entry_without_breaking(monkeypatch):
     prefix = f"pytest:{uuid.uuid4().hex}"
     _, redis_client, worker = _fresh_worker(monkeypatch, prefix=prefix, dry_run="false")
@@ -525,6 +565,16 @@ def test_replay_dlq_returns_locked_when_lock_is_held(monkeypatch):
     assert result["replayed"] == 0
     assert redis_client.redis_conn.llen(worker.DLQ_REDIS_KEY) == 1
     assert redis_client.redis_conn.get(worker.DLQ_REPLAY_LOCK_KEY) == b"other-token"
+    report = redis_client.redis_conn.hgetall(worker.DLQ_REPLAY_REPORT_KEY)
+    assert report[b"status"] == b"locked"
+    assert report[b"requested_limit"] == b"1"
+    assert report[b"effective_limit"] == b"1"
+    assert report[b"replayed"] == b"0"
+    assert report[b"remaining"] == b"1"
+    assert report[b"dry_run"] == b"0"
+    assert report[b"locked"] == b"1"
+    assert b"started_at" in report
+    assert b"finished_at" in report
 
 
 def test_replay_dlq_releases_lock_after_success(monkeypatch):
@@ -558,6 +608,14 @@ def test_replay_dlq_releases_lock_after_success(monkeypatch):
     assert result["status"] == "completed"
     assert result["dry_run"] is True
     assert redis_client.redis_conn.get(worker.DLQ_REPLAY_LOCK_KEY) is None
+    report = redis_client.redis_conn.hgetall(worker.DLQ_REPLAY_REPORT_KEY)
+    assert report[b"status"] == b"completed"
+    assert report[b"requested_limit"] == b"1"
+    assert report[b"effective_limit"] == b"1"
+    assert report[b"replayed"] == b"0"
+    assert report[b"remaining"] == b"1"
+    assert report[b"dry_run"] == b"1"
+    assert report[b"locked"] == b"0"
 
 
 def test_voice_circuit_opens_and_skips_while_open(monkeypatch):

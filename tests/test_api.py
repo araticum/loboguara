@@ -1,4 +1,5 @@
 import os
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -219,6 +220,8 @@ class FakeModelQuery:
         self._items = list(items)
         self._filters = []
         self._ordered = False
+        self._offset = 0
+        self._limit = None
 
     def filter(self, *criteria):
         self._filters.extend(criteria)
@@ -226,6 +229,14 @@ class FakeModelQuery:
 
     def order_by(self, *criteria):
         self._ordered = True
+        return self
+
+    def offset(self, value):
+        self._offset = value
+        return self
+
+    def limit(self, value):
+        self._limit = value
         return self
 
     def _matches(self, item):
@@ -243,8 +254,15 @@ class FakeModelQuery:
     def _filtered(self):
         items = [item for item in self._items if self._matches(item)]
         if self._ordered and items and hasattr(items[0], "created_at"):
-            items.sort(key=lambda item: getattr(item, "created_at"))
+            items.sort(key=lambda item: (getattr(item, "created_at"), getattr(item, "id", "")))
+        if self._offset:
+            items = items[self._offset :]
+        if self._limit is not None:
+            items = items[: self._limit]
         return items
+
+    def count(self):
+        return len([item for item in self._items if self._matches(item)])
 
     def all(self):
         return self._filtered()
@@ -891,6 +909,162 @@ def test_resolve_incident_success_404_and_409(client):
 
         conflict = client.post(f"/incidents/{open_incident.id}/resolve", json={"resolved_by": "bob"})
         assert conflict.status_code == 409
+    finally:
+        main.app.dependency_overrides.pop(main.get_db, None)
+
+
+def test_get_incident_timeline_success(client):
+    incident_id = uuid.UUID("00000000-0000-0000-0000-00000000d101")
+    incident = IncidentFixture(
+        id=str(incident_id),
+        external_event_id="evt-time-1",
+        source="prometheus",
+        severity="CRITICAL",
+        title="Timeline incident",
+        message="m",
+        payload_json={"k": "v"},
+        status=models.IncidentStatus.OPEN,
+        matched_rule_id=None,
+        dedupe_key=None,
+        created_at=datetime(2026, 3, 20, 9, 0, 0),
+    )
+    audit_logs = [
+        models.AuditLog(
+            id=uuid.UUID("00000000-0000-0000-0000-00000000d201"),
+            trace_id="trace-1",
+            incident_id=incident_id,
+            action=models.AuditAction.TASK_QUEUED,
+            details_json={"step": 2},
+            created_at=datetime(2026, 3, 20, 9, 10, 0),
+        ),
+        models.AuditLog(
+            id=uuid.UUID("00000000-0000-0000-0000-00000000d202"),
+            trace_id="trace-2",
+            incident_id=incident_id,
+            action=models.AuditAction.EVENT_RECEIVED,
+            details_json={"step": 1},
+            created_at=datetime(2026, 3, 20, 9, 5, 0),
+        ),
+        models.AuditLog(
+            id=uuid.UUID("00000000-0000-0000-0000-00000000d203"),
+            trace_id="trace-3",
+            incident_id=incident_id,
+            action=models.AuditAction.CALLBACK_RECEIVED,
+            details_json={"step": 3},
+            created_at=datetime(2026, 3, 20, 9, 20, 0),
+        ),
+    ]
+    fake_session = FakeLifecycleSession([incident], audit_logs=audit_logs)
+    main.app.dependency_overrides[main.get_db] = lambda: fake_session
+    try:
+        response = client.get(f"/incidents/{incident.id}/timeline?limit=2&offset=0")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["total"] == 3
+        assert payload["limit"] == 2
+        assert payload["offset"] == 0
+        assert [item["id"] for item in payload["items"]] == [
+            "00000000-0000-0000-0000-00000000d202",
+            "00000000-0000-0000-0000-00000000d201",
+        ]
+        assert [item["action"] for item in payload["items"]] == [
+            "EVENT_RECEIVED",
+            "TASK_QUEUED",
+        ]
+    finally:
+        main.app.dependency_overrides.pop(main.get_db, None)
+
+
+def test_get_incident_timeline_filter_action(client):
+    incident_id = uuid.UUID("00000000-0000-0000-0000-00000000d301")
+    incident = IncidentFixture(
+        id=str(incident_id),
+        external_event_id="evt-time-2",
+        source="grafana",
+        severity="WARN",
+        title="Timeline incident filter",
+        message=None,
+        payload_json=None,
+        status=models.IncidentStatus.OPEN,
+        matched_rule_id=None,
+        dedupe_key=None,
+        created_at=datetime(2026, 3, 20, 10, 0, 0),
+    )
+    audit_logs = [
+        models.AuditLog(
+            id=uuid.UUID("00000000-0000-0000-0000-00000000d301"),
+            trace_id="trace-4",
+            incident_id=incident_id,
+            action=models.AuditAction.EVENT_RECEIVED,
+            details_json={"step": 1},
+            created_at=datetime(2026, 3, 20, 10, 1, 0),
+        ),
+        models.AuditLog(
+            id=uuid.UUID("00000000-0000-0000-0000-00000000d302"),
+            trace_id="trace-5",
+            incident_id=incident_id,
+            action=models.AuditAction.TASK_QUEUED,
+            details_json={"step": 2},
+            created_at=datetime(2026, 3, 20, 10, 2, 0),
+        ),
+        models.AuditLog(
+            id=uuid.UUID("00000000-0000-0000-0000-00000000d303"),
+            trace_id="trace-6",
+            incident_id=incident_id,
+            action=models.AuditAction.EVENT_RECEIVED,
+            details_json={"step": 3},
+            created_at=datetime(2026, 3, 20, 10, 3, 0),
+        ),
+    ]
+    fake_session = FakeLifecycleSession([incident], audit_logs=audit_logs)
+    main.app.dependency_overrides[main.get_db] = lambda: fake_session
+    try:
+        response = client.get(f"/incidents/{incident.id}/timeline?action=EVENT_RECEIVED&limit=10&offset=0")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["total"] == 2
+        assert [item["action"] for item in payload["items"]] == [
+            "EVENT_RECEIVED",
+            "EVENT_RECEIVED",
+        ]
+        assert [item["id"] for item in payload["items"]] == [
+            "00000000-0000-0000-0000-00000000d301",
+            "00000000-0000-0000-0000-00000000d303",
+        ]
+    finally:
+        main.app.dependency_overrides.pop(main.get_db, None)
+
+
+def test_get_incident_timeline_limit_above_max(client):
+    incident_id = uuid.UUID("00000000-0000-0000-0000-00000000d401")
+    incident = IncidentFixture(
+        id=str(incident_id),
+        external_event_id="evt-time-4",
+        source="prometheus",
+        severity="CRITICAL",
+        title="Limit incident",
+        message=None,
+        payload_json=None,
+        status=models.IncidentStatus.OPEN,
+        matched_rule_id=None,
+        dedupe_key=None,
+        created_at=datetime(2026, 3, 20, 11, 0, 0),
+    )
+    fake_session = FakeLifecycleSession([incident], audit_logs=[])
+    main.app.dependency_overrides[main.get_db] = lambda: fake_session
+    try:
+        response = client.get(f"/incidents/{incident.id}/timeline?limit={main.OPS_ENDPOINT_MAX_LIMIT + 1}")
+        assert response.status_code == 400
+    finally:
+        main.app.dependency_overrides.pop(main.get_db, None)
+
+
+def test_get_incident_timeline_not_found(client):
+    fake_session = FakeLifecycleSession([], audit_logs=[])
+    main.app.dependency_overrides[main.get_db] = lambda: fake_session
+    try:
+        response = client.get("/incidents/00000000-0000-0000-0000-00000000ffff/timeline")
+        assert response.status_code == 404
     finally:
         main.app.dependency_overrides.pop(main.get_db, None)
 

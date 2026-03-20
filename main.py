@@ -681,6 +681,44 @@ def get_incident(incident_id: str, db: Session = Depends(get_db)):
         logs=[_serialize_audit(log) for log in audit_logs],
     )
 
+@app.get("/incidents/{incident_id}/timeline", response_model=schemas.IncidentTimelineResponse)
+def get_incident_timeline(
+    incident_id: str,
+    action: models.AuditAction | None = Query(default=None),
+    limit: int = Query(20, ge=1),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
+    try:
+        incident_uuid = uuid.UUID(incident_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid incident id") from exc
+
+    incident = db.query(models.Incident).filter(models.Incident.id == incident_uuid).first()
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    _validate_ops_limit(limit)
+
+    query = db.query(models.AuditLog).filter(models.AuditLog.incident_id == incident_uuid)
+    if action is not None:
+        query = query.filter(models.AuditLog.action == action)
+
+    total = query.count()
+    timeline_items = (
+        query.order_by(models.AuditLog.created_at.asc(), models.AuditLog.id.asc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+    return schemas.IncidentTimelineResponse(
+        total=total,
+        limit=limit,
+        offset=offset,
+        items=[_serialize_audit(log) for log in timeline_items],
+    )
+
 @app.post("/incidents/{incident_id}/ack", response_model=schemas.IncidentLifecycleResponse)
 def acknowledge_incident(
     incident_id: str,

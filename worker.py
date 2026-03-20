@@ -54,6 +54,7 @@ from .redis_client import redis_conn
 DLQ_REDIS_KEY = prefixed_redis_key(DLQ_QUEUE_NAME)
 DLQ_REPLAY_LOCK_KEY = prefixed_redis_key(f"{DLQ_QUEUE_NAME}:replay:lock")
 METRICS_REDIS_KEY = prefixed_redis_key(METRICS_KEY)
+DLQ_REPLAY_REPORT_KEY = prefixed_redis_key(f"{METRICS_KEY}:dlq_replay_last")
 
 celery_app = Celery("event_saas", broker=REDIS_URL, backend=REDIS_URL)
 
@@ -221,6 +222,51 @@ def _increment_metric_counter(prefix: str, channel: str, amount: int = 1) -> Non
 
 def _refresh_dlq_metric() -> None:
     _touch_metrics({"dlq_size": redis_conn.llen(DLQ_REDIS_KEY)})
+
+
+def _write_dlq_replay_report(
+    *,
+    status: str,
+    started_at: str | None,
+    finished_at: str | None,
+    requested_limit: int | None,
+    effective_limit: int | None,
+    replayed: int,
+    remaining: int,
+    dry_run: bool,
+    locked: bool,
+) -> None:
+    redis_conn.hset(
+        DLQ_REPLAY_REPORT_KEY,
+        mapping={
+            "status": status,
+            "started_at": started_at or "",
+            "finished_at": finished_at or "",
+            "requested_limit": "" if requested_limit is None else int(requested_limit),
+            "effective_limit": "" if effective_limit is None else int(effective_limit),
+            "replayed": int(replayed),
+            "remaining": int(remaining),
+            "dry_run": int(bool(dry_run)),
+            "locked": int(bool(locked)),
+        },
+    )
+    redis_conn.expire(DLQ_REPLAY_REPORT_KEY, METRICS_TTL_SECONDS)
+
+
+def get_dlq_replay_report() -> dict[str, str | int | bool]:
+    raw = redis_conn.hgetall(DLQ_REPLAY_REPORT_KEY)
+    report: dict[str, str | int | bool] = {}
+    for key, value in raw.items():
+        field = key.decode("utf-8") if isinstance(key, bytes) else str(key)
+        decoded = value.decode("utf-8") if isinstance(value, bytes) else value
+        if field in {"requested_limit", "effective_limit", "replayed", "remaining", "dry_run", "locked"}:
+            try:
+                report[field] = int(decoded)
+                continue
+            except (TypeError, ValueError):
+                pass
+        report[field] = decoded
+    return report
 
 
 def _bound_dlq_max_items(max_items: int | None = None) -> int:
@@ -825,52 +871,92 @@ def _replay_entry(entry: dict) -> bool:
 @celery_app.task(name="replay_dlq")
 def replay_dlq(limit: int | None = None):
     batch_limit = _bound_replay_limit(limit)
+    requested_limit = DLQ_REPLAY_BATCH_SIZE if limit is None else int(limit)
+    started_at = _metric_timestamp()
     lock_token = _acquire_dlq_replay_lock()
     if not lock_token:
+        remaining = redis_conn.llen(DLQ_REDIS_KEY)
+        _write_dlq_replay_report(
+            status="locked",
+            started_at=started_at,
+            finished_at=_metric_timestamp(),
+            requested_limit=requested_limit,
+            effective_limit=batch_limit,
+            replayed=0,
+            remaining=remaining,
+            dry_run=DLQ_REPLAY_DRY_RUN,
+            locked=True,
+        )
         return {
             "status": "locked",
             "replayed": 0,
-            "remaining": redis_conn.llen(DLQ_REDIS_KEY),
+            "remaining": remaining,
             "dry_run": DLQ_REPLAY_DRY_RUN,
             "limit": batch_limit,
             "candidates": None,
         }
 
     try:
-        raw_entries = redis_conn.lrange(DLQ_REDIS_KEY, 0, batch_limit - 1)
-        replayed = 0
-        candidates = []
+        try:
+            raw_entries = redis_conn.lrange(DLQ_REDIS_KEY, 0, batch_limit - 1)
+            replayed = 0
+            candidates = []
 
-        for raw_entry in raw_entries:
-            try:
-                entry = json.loads(raw_entry)
-                candidates.append(entry)
-                if DLQ_REPLAY_DRY_RUN:
+            for raw_entry in raw_entries:
+                try:
+                    entry = json.loads(raw_entry)
+                    candidates.append(entry)
+                    if DLQ_REPLAY_DRY_RUN:
+                        continue
+                    if _replay_entry(entry):
+                        redis_conn.lrem(DLQ_REDIS_KEY, 1, raw_entry)
+                        replayed += 1
+                        _refresh_dlq_metric()
+                except Exception:
                     continue
-                if _replay_entry(entry):
-                    redis_conn.lrem(DLQ_REDIS_KEY, 1, raw_entry)
-                    replayed += 1
-                    _refresh_dlq_metric()
-            except Exception:
-                continue
 
-        _refresh_dlq_metric()
-        result = {
-            "status": "completed",
-            "replayed": replayed,
-            "remaining": redis_conn.llen(DLQ_REDIS_KEY),
-            "dry_run": DLQ_REPLAY_DRY_RUN,
-            "limit": batch_limit,
-            "candidates": candidates if DLQ_REPLAY_DRY_RUN else None,
-        }
-        if DLQ_REPLAY_DRY_RUN:
-            _touch_metrics(
-                {
-                    "dlq_dry_run_candidates": len(candidates),
-                    "dlq_dry_run_limit": batch_limit,
-                }
+            _refresh_dlq_metric()
+            result = {
+                "status": "completed",
+                "replayed": replayed,
+                "remaining": redis_conn.llen(DLQ_REDIS_KEY),
+                "dry_run": DLQ_REPLAY_DRY_RUN,
+                "limit": batch_limit,
+                "candidates": candidates if DLQ_REPLAY_DRY_RUN else None,
+            }
+            if DLQ_REPLAY_DRY_RUN:
+                _touch_metrics(
+                    {
+                        "dlq_dry_run_candidates": len(candidates),
+                        "dlq_dry_run_limit": batch_limit,
+                    }
+                )
+            _write_dlq_replay_report(
+                status="completed",
+                started_at=started_at,
+                finished_at=_metric_timestamp(),
+                requested_limit=requested_limit,
+                effective_limit=batch_limit,
+                replayed=replayed,
+                remaining=result["remaining"],
+                dry_run=DLQ_REPLAY_DRY_RUN,
+                locked=False,
             )
-        return result
+            return result
+        except Exception as exc:
+            remaining = redis_conn.llen(DLQ_REDIS_KEY)
+            _write_dlq_replay_report(
+                status="error",
+                started_at=started_at,
+                finished_at=_metric_timestamp(),
+                requested_limit=requested_limit,
+                effective_limit=batch_limit,
+                replayed=0,
+                remaining=remaining,
+                dry_run=DLQ_REPLAY_DRY_RUN,
+                locked=False,
+            )
+            raise exc
     finally:
         _release_dlq_replay_lock(lock_token)
 
