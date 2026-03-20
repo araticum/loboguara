@@ -1,19 +1,47 @@
+import json
+import uuid
+from datetime import datetime, timezone
+
 from celery import Celery
+from celery.exceptions import Retry
+from celery.signals import task_failure
 from sqlalchemy.orm import Session
+
+from .config import (
+    DLQ_QUEUE_NAME,
+    DLQ_REPLAY_BATCH_SIZE,
+    DLQ_REPLAY_DRY_RUN,
+    DLQ_REPLAY_INTERVAL_SECONDS,
+    CELERY_TASK_MAX_RETRIES,
+    CELERY_TASK_RETRY_BACKOFF,
+    CELERY_TASK_RETRY_BACKOFF_MAX,
+    CELERY_TASK_RETRY_JITTER,
+    CELERY_TASK_SOFT_TIME_LIMIT,
+    CELERY_TASK_TIME_LIMIT,
+    METRICS_SNAPSHOT_INTERVAL_SECONDS,
+    OPS_ENDPOINT_MAX_LIMIT,
+    REDIS_URL,
+    METRICS_KEY,
+    METRICS_TTL_SECONDS,
+    queue_name,
+    prefixed_redis_key,
+)
 from .database import SessionLocal
 from .models import (
-    Incident,
-    GroupMember,
-    Notification,
-    AuditLog,
-    Rule,
-    IncidentStatus,
-    NotificationStatus,
-    NotificationChannel,
     AuditAction,
+    AuditLog,
+    GroupMember,
+    Incident,
+    IncidentStatus,
+    Notification,
+    NotificationChannel,
+    NotificationStatus,
+    Rule,
 )
-from .redis_client import acquire_idempotency_key
-from .config import REDIS_URL, queue_name
+from .redis_client import redis_conn
+
+DLQ_REDIS_KEY = prefixed_redis_key(DLQ_QUEUE_NAME)
+METRICS_REDIS_KEY = prefixed_redis_key(METRICS_KEY)
 
 celery_app = Celery("event_saas", broker=REDIS_URL, backend=REDIS_URL)
 
@@ -23,18 +51,288 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="UTC",
     enable_utc=True,
+    task_acks_late=True,
+    task_reject_on_worker_lost=True,
+    worker_prefetch_multiplier=1,
     task_routes={
         "dispatcher": {"queue": queue_name("dispatch")},
         "voice_worker": {"queue": queue_name("voice")},
+        "telegram_worker": {"queue": queue_name("telegram")},
+        "email_worker": {"queue": queue_name("email")},
         "escalation_worker": {"queue": queue_name("escalation")},
+        "replay_dlq": {"queue": queue_name(DLQ_QUEUE_NAME)},
+    },
+    beat_schedule={
+        "queue-metrics-snapshot": {
+            "task": "queue_metrics_snapshot",
+            "schedule": METRICS_SNAPSHOT_INTERVAL_SECONDS,
+        },
+        "dlq-replay": {
+            "task": "replay_dlq",
+            "schedule": DLQ_REPLAY_INTERVAL_SECONDS,
+        },
     },
 )
 
-@celery_app.task(name="dispatcher")
-def dispatch_incident(incident_id: str, incoming_trace_id: str):
-    if not acquire_idempotency_key(f"idemp:dispatch:{incident_id}", ttl_seconds=24 * 3600):
+
+def _notification_channel_value(channel: NotificationChannel | str) -> str:
+    return channel.value if isinstance(channel, NotificationChannel) else str(channel)
+
+
+def _notification_is_terminal(notification: Notification) -> bool:
+    return notification.status in {
+        NotificationStatus.SENT,
+        NotificationStatus.DELIVERED,
+        NotificationStatus.ANSWERED_VOICE,
+    }
+
+
+def _metric_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _touch_metrics(fields: dict[str, int | str]) -> None:
+    if not fields:
         return
 
+    pipe = redis_conn.pipeline()
+    pipe.hset(METRICS_REDIS_KEY, mapping=fields)
+    pipe.hset(METRICS_REDIS_KEY, "updated_at", _metric_timestamp())
+    pipe.expire(METRICS_REDIS_KEY, METRICS_TTL_SECONDS)
+    pipe.execute()
+
+
+def _increment_metric_counter(prefix: str, channel: str, amount: int = 1) -> None:
+    pipe = redis_conn.pipeline()
+    pipe.hincrby(METRICS_REDIS_KEY, f"{prefix}:{channel}", amount)
+    pipe.hset(METRICS_REDIS_KEY, "updated_at", _metric_timestamp())
+    pipe.expire(METRICS_REDIS_KEY, METRICS_TTL_SECONDS)
+    pipe.execute()
+
+
+def _refresh_dlq_metric() -> None:
+    _touch_metrics({"dlq_size": redis_conn.llen(DLQ_REDIS_KEY)})
+
+
+def _snapshot_queue_backlog() -> dict[str, int | str]:
+    snapshot = {
+        "queue_backlog:dispatch": redis_conn.llen(queue_name("dispatch")),
+        "queue_backlog:voice": redis_conn.llen(queue_name("voice")),
+        "queue_backlog:telegram": redis_conn.llen(queue_name("telegram")),
+        "queue_backlog:email": redis_conn.llen(queue_name("email")),
+        "queue_backlog:escalation": redis_conn.llen(queue_name("escalation")),
+        "queue_backlog:dlq": redis_conn.llen(DLQ_REDIS_KEY),
+    }
+    _touch_metrics(snapshot)
+    return snapshot
+
+
+def _bound_replay_limit(limit: int | None) -> int:
+    requested = DLQ_REPLAY_BATCH_SIZE if limit is None else int(limit)
+    return max(1, min(requested, OPS_ENDPOINT_MAX_LIMIT))
+
+
+def _get_or_create_notification(
+    db: Session,
+    incident_id: str,
+    contact_id: str,
+    channel: NotificationChannel,
+) -> tuple[Notification, bool]:
+    notification = (
+        db.query(Notification)
+        .filter(
+            Notification.incident_id == incident_id,
+            Notification.contact_id == contact_id,
+            Notification.channel == channel,
+        )
+        .first()
+    )
+    if notification:
+        return notification, False
+
+    notification = Notification(
+        incident_id=incident_id,
+        contact_id=contact_id,
+        channel=channel,
+    )
+    db.add(notification)
+    db.commit()
+    db.refresh(notification)
+    return notification, True
+
+
+def _queue_channel_send(notification_id: str, trace_id: str, channel: NotificationChannel) -> None:
+    task_map = {
+        NotificationChannel.VOICE: send_voice_call,
+        NotificationChannel.TELEGRAM: send_telegram_message,
+        NotificationChannel.EMAIL: send_email_message,
+    }
+    task = task_map.get(channel)
+    if not task:
+        return
+
+    task.apply_async(
+        args=(notification_id, trace_id),
+        queue=queue_name(channel.value.lower()),
+    )
+
+
+def _dlq_payload(
+    task_name: str,
+    args: tuple,
+    kwargs: dict,
+    exception: Exception | str,
+) -> dict:
+    trace_id = None
+    notification_id = None
+    incident_id = None
+
+    if len(args) > 1:
+        trace_id = args[1]
+    if len(args) > 0:
+        if task_name == "escalation_worker":
+            incident_id = args[0]
+        else:
+            notification_id = args[0]
+
+    trace_id = kwargs.get("trace_id", trace_id)
+    notification_id = kwargs.get("notification_id", notification_id)
+    incident_id = kwargs.get("incident_id", incident_id)
+
+    return {
+        "task_name": task_name,
+        "args": list(args),
+        "kwargs": kwargs,
+        "trace_id": trace_id,
+        "notification_id": notification_id,
+        "incident_id": incident_id,
+        "error": str(exception),
+        "failed_at": uuid.uuid4().hex,
+    }
+
+
+def _push_dlq_entry(task_name: str, args: tuple, kwargs: dict, exception: Exception | str) -> dict:
+    payload = _dlq_payload(task_name, args, kwargs, exception)
+    redis_conn.rpush(DLQ_REDIS_KEY, json.dumps(payload, sort_keys=True))
+    _refresh_dlq_metric()
+    return payload
+
+
+def _record_final_failure(
+    task_name: str,
+    payload: dict,
+) -> None:
+    db: Session = SessionLocal()
+    try:
+        trace_id = payload.get("trace_id") or str(uuid.uuid4())
+        notification_id = payload.get("notification_id")
+        incident_id = payload.get("incident_id")
+
+        if notification_id:
+            notification = (
+                db.query(Notification)
+                .filter(Notification.id == notification_id)
+                .with_for_update()
+                .first()
+            )
+            if notification and not _notification_is_terminal(notification):
+                notification.status = NotificationStatus.FAILED
+                notification.error_message = payload.get("error")
+                _increment_metric_counter(
+                    "tasks_failed_by_channel",
+                    _notification_channel_value(notification.channel),
+                )
+            if notification and not incident_id:
+                incident_id = notification.incident_id
+        elif task_name == "escalation_worker":
+            _increment_metric_counter("tasks_failed_by_channel", "ESCALATION")
+
+        db.add(
+            AuditLog(
+                trace_id=trace_id,
+                incident_id=incident_id,
+                action=AuditAction.FAILED,
+                details_json={
+                    "task_name": task_name,
+                    "notification_id": notification_id,
+                    "error": payload.get("error"),
+                },
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def _handle_task_final_failure(task_name: str, args: tuple, kwargs: dict, exception: Exception) -> None:
+    payload = _push_dlq_entry(task_name, args, kwargs, exception)
+    _record_final_failure(task_name, payload)
+
+
+@task_failure.connect(weak=False)
+def _on_task_failure(
+    sender=None,
+    task_id=None,
+    exception=None,
+    args=None,
+    kwargs=None,
+    traceback=None,
+    einfo=None,
+    **extra,
+):
+    task_name = getattr(sender, "name", None) or str(sender or "")
+    if task_name not in {"voice_worker", "telegram_worker", "email_worker", "escalation_worker"}:
+        return
+
+    # For autoretry tasks, only send to DLQ when retries are exhausted.
+    if isinstance(exception, Retry):
+        return
+    request_retries = getattr(getattr(sender, "request", None), "retries", 0)
+    max_retries = getattr(sender, "max_retries", CELERY_TASK_MAX_RETRIES)
+    if max_retries is not None and request_retries < max_retries:
+        return
+
+    _handle_task_final_failure(task_name, tuple(args or ()), dict(kwargs or {}), exception or Exception("task failed"))
+
+
+def _mark_notification_sent(
+    db: Session,
+    notification_id: str,
+    trace_id: str,
+    provider_channel: str,
+    provider_id: str | None = None,
+) -> bool:
+    notification = (
+        db.query(Notification)
+        .filter(Notification.id == notification_id)
+        .with_for_update()
+        .first()
+    )
+    if not notification:
+        raise LookupError(f"notification not found: {notification_id}")
+    if _notification_is_terminal(notification):
+        return False
+
+    notification.status = NotificationStatus.SENT
+    notification.external_provider_id = provider_id
+    _increment_metric_counter("tasks_sent_by_channel", provider_channel)
+    audit = AuditLog(
+        trace_id=trace_id,
+        incident_id=notification.incident_id,
+        action=AuditAction.NOTIFICATION_SENT,
+        details_json={
+            "channel": provider_channel,
+            "notification_id": notification_id,
+            "provider_id": provider_id,
+        },
+    )
+    db.add(audit)
+    db.commit()
+    return True
+
+
+@celery_app.task(name="dispatcher")
+def dispatch_incident(incident_id: str, incoming_trace_id: str):
     db: Session = SessionLocal()
     try:
         incident = db.query(Incident).filter(Incident.id == incident_id).first()
@@ -42,140 +340,264 @@ def dispatch_incident(incident_id: str, incoming_trace_id: str):
             return
 
         rule = db.query(Rule).filter(Rule.id == incident.matched_rule_id).first()
-        
         if not rule:
             return
-            
+
         group_members = db.query(GroupMember).filter(GroupMember.group_id == rule.recipient_group_id).all()
         channels = rule.channels
-        
-        # Cria as notificações para ser enviadas por cada worker de canal
+
         created_notifications = []
         for member in group_members:
             for channel in channels:
-                normalized_channel = str(channel).upper()
-                notif = Notification(
-                    incident_id=incident.id,
-                    contact_id=member.contact_id,
-                    channel=NotificationChannel[normalized_channel]
+                try:
+                    notification_channel = NotificationChannel[str(channel).upper()]
+                except KeyError:
+                    continue
+
+                notif, created = _get_or_create_notification(
+                    db,
+                    str(incident.id),
+                    str(member.contact_id),
+                    notification_channel,
                 )
-                db.add(notif)
-                created_notifications.append(notif)
-                
-        db.commit()
-        
-        # Agora manda para as filas apropriadas
+                if created or not _notification_is_terminal(notif):
+                    created_notifications.append(notif)
+
         for notif in created_notifications:
-            # Audit log de envio pra fila
+            channel_value = _notification_channel_value(notif.channel)
             audit = AuditLog(
                 trace_id=incoming_trace_id,
                 incident_id=incident.id,
                 action=AuditAction.TASK_QUEUED,
-                details_json={"channel": notif.channel, "notification_id": str(notif.id)}
+                details_json={
+                    "channel": channel_value,
+                    "notification_id": str(notif.id),
+                },
             )
             db.add(audit)
-            
+            db.commit()
+
             if notif.channel == NotificationChannel.VOICE:
-                send_voice_call.apply_async(
-                    args=(str(notif.id), incoming_trace_id),
-                    queue=queue_name("voice"),
-                )
+                _queue_channel_send(str(notif.id), incoming_trace_id, NotificationChannel.VOICE)
             elif notif.channel == NotificationChannel.TELEGRAM:
-                # TODO: implementar worker dedicado
-                continue
+                _queue_channel_send(str(notif.id), incoming_trace_id, NotificationChannel.TELEGRAM)
             elif notif.channel == NotificationChannel.EMAIL:
-                # TODO: implementar worker dedicado
-                continue
-                
+                _queue_channel_send(str(notif.id), incoming_trace_id, NotificationChannel.EMAIL)
+    finally:
+        db.close()
+
+
+@celery_app.task(
+    name="voice_worker",
+    bind=True,
+    autoretry_for=(Exception,),
+    retry_backoff=CELERY_TASK_RETRY_BACKOFF,
+    retry_backoff_max=CELERY_TASK_RETRY_BACKOFF_MAX,
+    retry_jitter=CELERY_TASK_RETRY_JITTER,
+    max_retries=CELERY_TASK_MAX_RETRIES,
+    soft_time_limit=CELERY_TASK_SOFT_TIME_LIMIT,
+    time_limit=CELERY_TASK_TIME_LIMIT,
+)
+def send_voice_call(self, notification_id: str, trace_id: str):
+    return _send_voice_call_impl(notification_id, trace_id)
+
+
+def _send_voice_call_impl(notification_id: str, trace_id: str):
+    db: Session = SessionLocal()
+    try:
+        return _mark_notification_sent(db, notification_id, trace_id, "VOICE")
+    finally:
+        db.close()
+
+
+@celery_app.task(
+    name="telegram_worker",
+    bind=True,
+    autoretry_for=(Exception,),
+    retry_backoff=CELERY_TASK_RETRY_BACKOFF,
+    retry_backoff_max=CELERY_TASK_RETRY_BACKOFF_MAX,
+    retry_jitter=CELERY_TASK_RETRY_JITTER,
+    max_retries=CELERY_TASK_MAX_RETRIES,
+    soft_time_limit=CELERY_TASK_SOFT_TIME_LIMIT,
+    time_limit=CELERY_TASK_TIME_LIMIT,
+)
+def send_telegram_message(self, notification_id: str, trace_id: str):
+    return _send_telegram_message_impl(notification_id, trace_id)
+
+
+def _send_telegram_message_impl(notification_id: str, trace_id: str):
+    db: Session = SessionLocal()
+    try:
+        return _mark_notification_sent(db, notification_id, trace_id, "TELEGRAM")
+    finally:
+        db.close()
+
+
+@celery_app.task(
+    name="email_worker",
+    bind=True,
+    autoretry_for=(Exception,),
+    retry_backoff=CELERY_TASK_RETRY_BACKOFF,
+    retry_backoff_max=CELERY_TASK_RETRY_BACKOFF_MAX,
+    retry_jitter=CELERY_TASK_RETRY_JITTER,
+    max_retries=CELERY_TASK_MAX_RETRIES,
+    soft_time_limit=CELERY_TASK_SOFT_TIME_LIMIT,
+    time_limit=CELERY_TASK_TIME_LIMIT,
+)
+def send_email_message(self, notification_id: str, trace_id: str):
+    return _send_email_message_impl(notification_id, trace_id)
+
+
+def _send_email_message_impl(notification_id: str, trace_id: str):
+    db: Session = SessionLocal()
+    try:
+        return _mark_notification_sent(db, notification_id, trace_id, "EMAIL")
+    finally:
+        db.close()
+
+
+@celery_app.task(
+    name="escalation_worker",
+    bind=True,
+    autoretry_for=(Exception,),
+    retry_backoff=CELERY_TASK_RETRY_BACKOFF,
+    retry_backoff_max=CELERY_TASK_RETRY_BACKOFF_MAX,
+    retry_jitter=CELERY_TASK_RETRY_JITTER,
+    max_retries=CELERY_TASK_MAX_RETRIES,
+    soft_time_limit=CELERY_TASK_SOFT_TIME_LIMIT,
+    time_limit=CELERY_TASK_TIME_LIMIT,
+)
+def handle_escalation(self, incident_id: str, trace_id: str):
+    return _handle_escalation_impl(incident_id, trace_id)
+
+
+def _handle_escalation_impl(incident_id: str, trace_id: str):
+    db: Session = SessionLocal()
+    try:
+        incident = (
+            db.query(Incident)
+            .filter(Incident.id == incident_id)
+            .with_for_update()
+            .first()
+        )
+        if not incident:
+            raise LookupError(f"incident not found: {incident_id}")
+        if incident.status != IncidentStatus.OPEN:
+            return True
+
+        incident.status = IncidentStatus.ESCALATED
+        audit = AuditLog(
+            trace_id=trace_id,
+            incident_id=incident.id,
+            action=AuditAction.ESCALATED,
+            details_json={"reason": "ACK deadline expired without acknowledgment."},
+        )
+        db.add(audit)
         db.commit()
-        
-        # Se exige de fallback
-        if rule.requires_ack and rule.ack_deadline:
-            handle_escalation.apply_async(
-                args=(incident_id, incoming_trace_id),
-                countdown=rule.ack_deadline,
-                queue=queue_name("escalation"),
-            )
-            
+
+        rule = db.query(Rule).filter(Rule.id == incident.matched_rule_id).first()
+        if not rule or not rule.fallback_policy_json:
+            return True
+
+        policy = rule.fallback_policy_json
+        escalation_group_id = policy.get("escalation_group_id") or policy.get("escalation_group")
+        fallback_channels = policy.get("channels", ["VOICE"])
+
+        if not escalation_group_id:
+            return True
+
+        members = db.query(GroupMember).filter(GroupMember.group_id == escalation_group_id).all()
+        for member in members:
+            for channel in fallback_channels:
+                try:
+                    notification_channel = NotificationChannel[str(channel).upper()]
+                except KeyError:
+                    continue
+
+                notif, _ = _get_or_create_notification(
+                    db,
+                    str(incident.id),
+                    str(member.contact_id),
+                    notification_channel,
+                )
+                if _notification_is_terminal(notif):
+                    continue
+                audit_2 = AuditLog(
+                    trace_id=trace_id,
+                    incident_id=incident.id,
+                    action=AuditAction.FALLBACK_TASK_QUEUED,
+                    details_json={
+                        "channel": notification_channel.value,
+                        "notification_id": str(notif.id),
+                    },
+                )
+                db.add(audit_2)
+                db.commit()
+
+                _queue_channel_send(str(notif.id), trace_id, notification_channel)
+        return True
     finally:
         db.close()
 
-@celery_app.task(name="voice_worker")
-def send_voice_call(notification_id: str, trace_id: str):
-    if not acquire_idempotency_key(f"idemp:voice:{notification_id}", ttl_seconds=24 * 3600):
-        return
 
-    db: Session = SessionLocal()
-    try:
-        notif = db.query(Notification).filter(Notification.id == notification_id).first()
-        if notif:
-            # Integração fake com Twilio API Client
-            # client.calls.create(to=contact.phone, from_="+1...", url=f"https://api.site.com/dispatch/voice/twiml/{notif.id}")
-            notif.status = NotificationStatus.SENT
-            
-            audit = AuditLog(
-                trace_id=trace_id,
-                incident_id=notif.incident_id,
-                action=AuditAction.NOTIFICATION_SENT,
-                details_json={"channel": "VOICE", "notification_id": notification_id}
-            )
-            db.add(audit)
-            db.commit()
-    finally:
-        db.close()
+def _replay_entry(entry: dict) -> bool:
+    task_name = entry.get("task_name")
+    args = entry.get("args", [])
+    kwargs = entry.get("kwargs", {})
 
-@celery_app.task(name="escalation_worker")
-def handle_escalation(incident_id: str, trace_id: str):
-    if not acquire_idempotency_key(f"idemp:escalation:{incident_id}", ttl_seconds=24 * 3600):
-        return
+    if task_name == "voice_worker":
+        _send_voice_call_impl(args[0], args[1])
+        return True
+    if task_name == "telegram_worker":
+        _send_telegram_message_impl(args[0], args[1])
+        return True
+    if task_name == "email_worker":
+        _send_email_message_impl(args[0], args[1])
+        return True
+    if task_name == "escalation_worker":
+        return _handle_escalation_impl(args[0], args[1])
+    return False
 
-    db: Session = SessionLocal()
-    try:
-        incident = db.query(Incident).filter(Incident.id == incident_id).first()
-        if incident and incident.status == IncidentStatus.OPEN:
-            # Significa que não deram ACK
-            incident.status = IncidentStatus.ESCALATED
-            audit = AuditLog(
-                trace_id=trace_id,
-                incident_id=incident.id,
-                action=AuditAction.ESCALATED,
-                details_json={"reason": "ACK deadline expired without acknowledgment."}
-            )
-            db.add(audit)
-            db.commit()
-            # Chama lógica de Fallback descrita nas regras
-            rule = db.query(Rule).filter(Rule.id == incident.matched_rule_id).first()
-            if rule and rule.fallback_policy_json:
-                policy = rule.fallback_policy_json
-                escalation_group_id = policy.get("escalation_group_id") or policy.get("escalation_group")
-                fallback_channels = policy.get("channels", ["VOICE"])
-                
-                if escalation_group_id:
-                    members = db.query(GroupMember).filter(GroupMember.group_id == escalation_group_id).all()
-                    for m in members:
-                        for ch in fallback_channels:
-                            normalized = str(ch).upper()
-                            notif = Notification(
-                                incident_id=incident.id,
-                                contact_id=m.contact_id,
-                                channel=NotificationChannel[normalized],
-                            )
-                            db.add(notif)
-                            db.commit()
-                            
-                            audit_2 = AuditLog(
-                                trace_id=trace_id,
-                                incident_id=incident.id,
-                                action=AuditAction.FALLBACK_TASK_QUEUED,
-                                details_json={"channel": ch, "notification_id": str(notif.id)}
-                            )
-                            db.add(audit_2)
-                            db.commit()
-                            
-                            if normalized == "VOICE":
-                                send_voice_call.apply_async(
-                                    args=(str(notif.id), trace_id),
-                                    queue=queue_name("voice"),
-                                )
-    finally:
-        db.close()
+
+@celery_app.task(name="replay_dlq")
+def replay_dlq(limit: int | None = None):
+    batch_limit = _bound_replay_limit(limit)
+
+    raw_entries = redis_conn.lrange(DLQ_REDIS_KEY, 0, batch_limit - 1)
+    replayed = 0
+    candidates = []
+
+    for raw_entry in raw_entries:
+        try:
+            entry = json.loads(raw_entry)
+            candidates.append(entry)
+            if DLQ_REPLAY_DRY_RUN:
+                continue
+            if _replay_entry(entry):
+                redis_conn.lrem(DLQ_REDIS_KEY, 1, raw_entry)
+                replayed += 1
+                _refresh_dlq_metric()
+        except Exception:
+            continue
+
+    _refresh_dlq_metric()
+    result = {
+        "replayed": replayed,
+        "remaining": redis_conn.llen(DLQ_REDIS_KEY),
+        "dry_run": DLQ_REPLAY_DRY_RUN,
+        "limit": batch_limit,
+        "candidates": candidates if DLQ_REPLAY_DRY_RUN else None,
+    }
+    if DLQ_REPLAY_DRY_RUN:
+        _touch_metrics(
+            {
+                "dlq_dry_run_candidates": len(candidates),
+                "dlq_dry_run_limit": batch_limit,
+            }
+        )
+    return result
+
+
+@celery_app.task(name="queue_metrics_snapshot")
+def queue_metrics_snapshot():
+    return _snapshot_queue_backlog()

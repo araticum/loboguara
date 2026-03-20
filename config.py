@@ -33,6 +33,28 @@ QUEUE_PREFIX = os.getenv("SERIEMA_QUEUE_PREFIX", "queue:seriema")
 
 APP_BASE_URL = os.getenv("APP_BASE_URL", "https://api.event-saas.com")
 
+CELERY_TASK_MAX_RETRIES = int(os.getenv("SERIEMA_TASK_MAX_RETRIES", "5"))
+CELERY_TASK_RETRY_BACKOFF = int(os.getenv("SERIEMA_TASK_RETRY_BACKOFF", "2"))
+CELERY_TASK_RETRY_BACKOFF_MAX = int(os.getenv("SERIEMA_TASK_RETRY_BACKOFF_MAX", "60"))
+CELERY_TASK_RETRY_JITTER = os.getenv("SERIEMA_TASK_RETRY_JITTER", "true").lower() == "true"
+CELERY_TASK_SOFT_TIME_LIMIT = int(os.getenv("SERIEMA_TASK_SOFT_TIME_LIMIT", "30"))
+CELERY_TASK_TIME_LIMIT = int(os.getenv("SERIEMA_TASK_TIME_LIMIT", "45"))
+DLQ_QUEUE_NAME = os.getenv("SERIEMA_DLQ_QUEUE_NAME", "dlq")
+DLQ_REPLAY_BATCH_SIZE = int(os.getenv("SERIEMA_DLQ_REPLAY_BATCH_SIZE", "10"))
+METRICS_KEY = os.getenv("SERIEMA_METRICS_KEY", "metrics:ops")
+METRICS_TTL_SECONDS = int(os.getenv("SERIEMA_METRICS_TTL_SECONDS", "120"))
+METRICS_SNAPSHOT_INTERVAL_SECONDS = int(
+    os.getenv("SERIEMA_METRICS_SNAPSHOT_INTERVAL_SECONDS", "60")
+)
+DLQ_REPLAY_INTERVAL_SECONDS = int(
+    os.getenv("SERIEMA_DLQ_REPLAY_INTERVAL_SECONDS", "120")
+)
+OPS_ENDPOINT_MAX_LIMIT = int(os.getenv("SERIEMA_OPS_MAX_LIMIT", "100"))
+VOICE_WEBHOOK_MAX_SKEW_SECONDS = int(
+    os.getenv("VOICE_WEBHOOK_MAX_AGE_SECONDS", "300")
+)
+DLQ_REPLAY_DRY_RUN = os.getenv("SERIEMA_DLQ_REPLAY_DRY_RUN", "false").lower() == "true"
+
 
 def queue_name(suffix: str) -> str:
     normalized = suffix.strip(":")

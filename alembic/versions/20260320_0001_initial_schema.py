@@ -96,6 +96,8 @@ def upgrade() -> None:
         sa.Column("condition_json", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
         sa.Column("recipient_group_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("channels", sa.JSON(), nullable=False),
+        sa.Column("active", sa.Boolean(), nullable=False, server_default=sa.text("true")),
+        sa.Column("priority", sa.Integer(), nullable=False, server_default="100"),
         sa.Column("requires_ack", sa.Boolean(), nullable=True),
         sa.Column("ack_deadline", sa.Integer(), nullable=True),
         sa.Column("fallback_policy_json", postgresql.JSONB(astext_type=sa.Text()), nullable=True),

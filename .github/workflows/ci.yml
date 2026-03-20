@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: eventsaas
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d eventsaas"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 56379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:55432/eventsaas
+      REDIS_URL: redis://localhost:56379/0
+      SERIEMA_DB_SCHEMA: seriema
+      SERIEMA_REDIS_DB: "5"
+      SERIEMA_REDIS_KEY_PREFIX: seriema
+      SERIEMA_QUEUE_PREFIX: queue:seriema
+      SERIEMA_OPS_MAX_LIMIT: "100"
+      SERIEMA_ADMIN_TOKEN: ci-admin-token
+      VOICE_WEBHOOK_SECRET: ci-voice-secret
+      VOICE_WEBHOOK_MAX_AGE_SECONDS: "300"
+      SERIEMA_DLQ_REPLAY_DRY_RUN: "true"
+      SERIEMA_METRICS_KEY: metrics:ops
+      SERIEMA_METRICS_TTL_SECONDS: "120"
+      SERIEMA_METRICS_SNAPSHOT_INTERVAL_SECONDS: "60"
+      SERIEMA_DLQ_REPLAY_INTERVAL_SECONDS: "120"
+      SERIEMA_DLQ_QUEUE_NAME: dlq
+      SERIEMA_DLQ_REPLAY_BATCH_SIZE: "10"
+      SERIEMA_TASK_MAX_RETRIES: "5"
+      SERIEMA_TASK_RETRY_BACKOFF: "2"
+      SERIEMA_TASK_RETRY_BACKOFF_MAX: "60"
+      SERIEMA_TASK_RETRY_JITTER: "true"
+      SERIEMA_TASK_SOFT_TIME_LIMIT: "30"
+      SERIEMA_TASK_TIME_LIMIT: "45"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set Up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest httpx
+
+      - name: Compile All
+        run: python -m compileall alembic config.py database.py engine.py main.py models.py redis_client.py schemas.py worker.py tests
+
+      - name: Run Tests
+        run: python -m pytest tests -q
+
+      - name: Alembic Offline SQL
+        run: python -m alembic -c alembic.ini upgrade head --sql

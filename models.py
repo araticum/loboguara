@@ -32,6 +32,7 @@ class AuditAction(str, Enum):
     RULE_MATCHED = "RULE_MATCHED"
     TASK_QUEUED = "TASK_QUEUED"
     NOTIFICATION_SENT = "NOTIFICATION_SENT"
+    FAILED = "FAILED"
     CALLBACK_RECEIVED = "CALLBACK_RECEIVED"
     ACK_RECEIVED = "ACK_RECEIVED"
     ESCALATED = "ESCALATED"
@@ -69,6 +70,8 @@ class Rule(Base):
     condition_json = Column(JSONB, nullable=False)  # e.g., {"source": "prometheus", "severity": "CRITICAL"}
     recipient_group_id = Column(UUID(as_uuid=True), ForeignKey("groups.id"), nullable=False)
     channels = Column(JSON, nullable=False)  # list of strings: ['voice', 'telegram', 'email']
+    active = Column(Boolean, nullable=False, default=True)
+    priority = Column(Integer, nullable=False, default=100)
     requires_ack = Column(Boolean, default=False)
     ack_deadline = Column(Integer, nullable=True)  # in seconds
     fallback_policy_json = Column(JSONB, nullable=True)

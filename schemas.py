@@ -1,5 +1,5 @@
 from datetime import datetime
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 import uuid
 from .models import IncidentStatus, NotificationStatus, NotificationChannel, AuditAction
@@ -31,11 +31,20 @@ class GroupCreate(BaseModel):
 class GroupResponse(GroupCreate):
     id: uuid.UUID
 
+class GroupMemberCreate(BaseModel):
+    contact_id: uuid.UUID
+
+class GroupMemberResponse(BaseModel):
+    group_id: uuid.UUID
+    contact_id: uuid.UUID
+
 class RuleCreate(BaseModel):
     rule_name: str
     condition_json: Dict[str, Any]
     recipient_group_id: uuid.UUID
     channels: List[str]
+    active: bool = True
+    priority: int = 100
     requires_ack: bool = False
     ack_deadline: Optional[int] = None
     fallback_policy_json: Optional[Dict[str, Any]] = None
@@ -88,3 +97,46 @@ class AuditLogResponse(BaseModel):
 class IncidentDetailsResponse(BaseModel):
     incident: IncidentResponse
     logs: List[AuditLogResponse]
+
+class IncidentStatusCount(BaseModel):
+    status: IncidentStatus
+    count: int
+
+class SLAMetricsResponse(BaseModel):
+    hours: int
+    window_start: datetime
+    window_end: datetime
+    total_incidents: int
+    acknowledged_incidents: int
+    acknowledgement_rate: float
+    average_tta_seconds: Optional[float] = None
+    incidents_by_status: List[IncidentStatusCount]
+
+class QueueMetricsResponse(BaseModel):
+    dispatch: int
+    voice: int
+    telegram: int
+    email: int
+    escalation: int
+    dlq: int
+
+class DLQPreviewItem(BaseModel):
+    task_name: str
+    trace_id: Optional[str] = None
+    notification_id: Optional[str] = None
+    incident_id: Optional[str] = None
+    error: Optional[str] = None
+    args: List[Any] = Field(default_factory=list)
+    kwargs: Dict[str, Any] = Field(default_factory=dict)
+    failed_at: Optional[str] = None
+
+class DLQPreviewResponse(BaseModel):
+    limit: int
+    total_items: int
+    items: List[DLQPreviewItem]
+
+class DLQReplayResponse(BaseModel):
+    status: str
+    limit: int
+    result: Optional[Dict[str, Any]] = None
+    task_id: Optional[str] = None
