@@ -1,5 +1,5 @@
 from datetime import datetime
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from typing import List, Optional, Dict, Any, Literal
 import uuid
 from .models import IncidentStatus, NotificationStatus, NotificationChannel, AuditAction
@@ -201,6 +201,19 @@ class DLQReplayResponse(BaseModel):
     limit: int
     result: Optional[Dict[str, Any]] = None
     task_id: Optional[str] = None
+
+class DLQReplayReportResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    status: str
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    requested_limit: Optional[int] = None
+    effective_limit: Optional[int] = None
+    replayed: int = 0
+    remaining: int = 0
+    dry_run: bool = False
+    locked: bool = False
 
 class OperationalAlert(BaseModel):
     alert_type: str

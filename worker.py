@@ -235,6 +235,8 @@ def _write_dlq_replay_report(
     remaining: int,
     dry_run: bool,
     locked: bool,
+    candidates_count: int | None = None,
+    error_message: str | None = None,
 ) -> None:
     redis_conn.hset(
         DLQ_REPLAY_REPORT_KEY,
@@ -248,6 +250,8 @@ def _write_dlq_replay_report(
             "remaining": int(remaining),
             "dry_run": int(bool(dry_run)),
             "locked": int(bool(locked)),
+            "candidates_count": "" if candidates_count is None else int(candidates_count),
+            "error_message": error_message or "",
         },
     )
     redis_conn.expire(DLQ_REPLAY_REPORT_KEY, METRICS_TTL_SECONDS)
@@ -259,7 +263,15 @@ def get_dlq_replay_report() -> dict[str, str | int | bool]:
     for key, value in raw.items():
         field = key.decode("utf-8") if isinstance(key, bytes) else str(key)
         decoded = value.decode("utf-8") if isinstance(value, bytes) else value
-        if field in {"requested_limit", "effective_limit", "replayed", "remaining", "dry_run", "locked"}:
+        if field in {
+            "requested_limit",
+            "effective_limit",
+            "replayed",
+            "remaining",
+            "dry_run",
+            "locked",
+            "candidates_count",
+        }:
             try:
                 report[field] = int(decoded)
                 continue
@@ -873,6 +885,7 @@ def replay_dlq(limit: int | None = None):
     batch_limit = _bound_replay_limit(limit)
     requested_limit = DLQ_REPLAY_BATCH_SIZE if limit is None else int(limit)
     started_at = _metric_timestamp()
+    candidates_count = 0
     lock_token = _acquire_dlq_replay_lock()
     if not lock_token:
         remaining = redis_conn.llen(DLQ_REDIS_KEY)
@@ -886,6 +899,8 @@ def replay_dlq(limit: int | None = None):
             remaining=remaining,
             dry_run=DLQ_REPLAY_DRY_RUN,
             locked=True,
+            candidates_count=0,
+            error_message="",
         )
         return {
             "status": "locked",
@@ -915,6 +930,7 @@ def replay_dlq(limit: int | None = None):
                 except Exception:
                     continue
 
+            candidates_count = len(candidates)
             _refresh_dlq_metric()
             result = {
                 "status": "completed",
@@ -941,6 +957,8 @@ def replay_dlq(limit: int | None = None):
                 remaining=result["remaining"],
                 dry_run=DLQ_REPLAY_DRY_RUN,
                 locked=False,
+                candidates_count=candidates_count,
+                error_message="",
             )
             return result
         except Exception as exc:
@@ -955,6 +973,8 @@ def replay_dlq(limit: int | None = None):
                 remaining=remaining,
                 dry_run=DLQ_REPLAY_DRY_RUN,
                 locked=False,
+                candidates_count=candidates_count,
+                error_message=str(exc),
             )
             raise exc
     finally:

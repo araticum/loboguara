@@ -14,7 +14,7 @@ from . import models, schemas
 from .database import get_db
 from .redis_client import is_duplicate, redis_conn
 from .engine import evaluate_rules
-from .worker import dispatch_incident, replay_dlq, celery_app
+from .worker import dispatch_incident, replay_dlq, celery_app, get_dlq_replay_report
 from .config import (
     APP_BASE_URL,
     ALERT_ACK_RATE_WARN,
@@ -930,6 +930,49 @@ def replay_dlq_operations(
         task_id=getattr(result, "id", None),
         result=None,
     )
+
+def _coerce_optional_int(value):
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+def _coerce_optional_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None or value == "":
+        return False
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "off"}:
+            return False
+    try:
+        return bool(int(value))
+    except (TypeError, ValueError):
+        return bool(value)
+
+@app.get("/ops/dlq/replay/last", response_model=schemas.DLQReplayReportResponse)
+def get_last_dlq_replay_report():
+    raw_report = get_dlq_replay_report() or {}
+    normalized = {
+        "status": str(raw_report.get("status") or "empty"),
+        "started_at": raw_report.get("started_at") or None,
+        "finished_at": raw_report.get("finished_at") or None,
+        "requested_limit": _coerce_optional_int(raw_report.get("requested_limit")),
+        "effective_limit": _coerce_optional_int(raw_report.get("effective_limit")),
+        "replayed": _coerce_optional_int(raw_report.get("replayed")) or 0,
+        "remaining": _coerce_optional_int(raw_report.get("remaining")) or 0,
+        "dry_run": _coerce_optional_bool(raw_report.get("dry_run")),
+        "locked": _coerce_optional_bool(raw_report.get("locked")),
+    }
+    for key, value in raw_report.items():
+        if key not in normalized:
+            normalized[key] = value
+    return schemas.DLQReplayReportResponse(**normalized)
 
 @app.get("/dispatch/voice/twiml/{notification_id}")
 @app.post("/dispatch/voice/twiml/{notification_id}")

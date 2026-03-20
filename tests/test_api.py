@@ -671,6 +671,56 @@ def test_ops_dlq_preview_and_replay_auth_and_limit(client, monkeypatch):
     assert replay_payload["result"]["replayed"] == 1
 
 
+def test_ops_dlq_replay_last_without_report(client, monkeypatch):
+    monkeypatch.setattr(main, "get_dlq_replay_report", lambda: {})
+
+    response = client.get("/ops/dlq/replay/last")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "empty"
+    assert payload["started_at"] is None
+    assert payload["finished_at"] is None
+    assert payload["requested_limit"] is None
+    assert payload["effective_limit"] is None
+    assert payload["replayed"] == 0
+    assert payload["remaining"] == 0
+    assert payload["dry_run"] is False
+    assert payload["locked"] is False
+
+
+def test_ops_dlq_replay_last_with_report(client, monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "get_dlq_replay_report",
+        lambda: {
+            "status": "completed",
+            "started_at": "2026-03-20T10:00:00+00:00",
+            "finished_at": "2026-03-20T10:01:00+00:00",
+            "requested_limit": 20,
+            "effective_limit": 5,
+            "replayed": 4,
+            "remaining": 1,
+            "dry_run": 0,
+            "locked": 1,
+        },
+    )
+
+    response = client.get("/ops/dlq/replay/last")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "completed"
+    assert payload["started_at"] == "2026-03-20T10:00:00+00:00"
+    assert payload["finished_at"] == "2026-03-20T10:01:00+00:00"
+    assert payload["requested_limit"] == 20
+    assert payload["effective_limit"] == 5
+    assert payload["replayed"] == 4
+    assert payload["remaining"] == 1
+    assert payload["dry_run"] is False
+    assert payload["locked"] is True
+
+
 def test_list_incidents_filters_and_pagination(client):
     incidents = [
         IncidentFixture(

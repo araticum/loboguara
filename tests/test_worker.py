@@ -434,6 +434,15 @@ def test_replay_dlq_dry_run_does_not_remove_items(monkeypatch):
     assert result["remaining"] == 1
     assert result["limit"] == 2
     assert result["candidates"] and result["candidates"][0]["notification_id"] == "notification-1"
+    report = redis_client.redis_conn.hgetall(worker.DLQ_REPLAY_REPORT_KEY)
+    assert report[b"status"] == b"completed"
+    assert report[b"candidates_count"] == b"1"
+    assert report[b"requested_limit"] == b"2"
+    assert report[b"effective_limit"] == b"2"
+    assert report[b"replayed"] == b"0"
+    assert report[b"remaining"] == b"1"
+    assert report[b"dry_run"] == b"1"
+    assert report[b"locked"] == b"0"
 
 
 def test_replay_dlq_persists_report_on_success(monkeypatch):
@@ -492,6 +501,48 @@ def test_replay_dlq_ignores_invalid_entry_without_breaking(monkeypatch):
     assert after == 1
     assert result["replayed"] == 0
     assert result["remaining"] == 1
+
+
+def test_replay_dlq_persists_error_message_on_failure(monkeypatch):
+    prefix = f"pytest:{uuid.uuid4().hex}"
+    _, redis_client, worker = _fresh_worker(monkeypatch, prefix=prefix, dry_run="false")
+
+    _clear_prefix(redis_client.redis_conn, prefix)
+
+    redis_client.redis_conn.rpush(
+        worker.DLQ_REDIS_KEY,
+        json.dumps(
+            {
+                "task_name": "email_worker",
+                "args": ["notification-error", "trace-error"],
+                "kwargs": {},
+                "trace_id": "trace-error",
+                "notification_id": "notification-error",
+                "incident_id": "incident-error",
+                "error": "boom",
+                "failed_at": "fixed-error",
+            }
+        ),
+    )
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("boom-from-lrange")
+
+    monkeypatch.setattr(redis_client.redis_conn, "lrange", _boom)
+
+    with pytest.raises(RuntimeError, match="boom-from-lrange"):
+        worker.replay_dlq(limit=1)
+
+    report = redis_client.redis_conn.hgetall(worker.DLQ_REPLAY_REPORT_KEY)
+    assert report[b"status"] == b"error"
+    assert report[b"error_message"] == b"boom-from-lrange"
+    assert report[b"requested_limit"] == b"1"
+    assert report[b"effective_limit"] == b"1"
+    assert report[b"replayed"] == b"0"
+    assert report[b"remaining"] == b"1"
+    assert report[b"dry_run"] == b"0"
+    assert report[b"locked"] == b"0"
+    assert report[b"candidates_count"] == b"0"
 
 
 def test_dlq_truncates_and_prunes_to_max_items(monkeypatch):
