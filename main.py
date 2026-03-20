@@ -681,6 +681,94 @@ def get_incident(incident_id: str, db: Session = Depends(get_db)):
         logs=[_serialize_audit(log) for log in audit_logs],
     )
 
+@app.post("/incidents/{incident_id}/ack", response_model=schemas.IncidentLifecycleResponse)
+def acknowledge_incident(
+    incident_id: str,
+    payload: schemas.AckIncidentRequest,
+    db: Session = Depends(get_db),
+):
+    try:
+        incident_uuid = uuid.UUID(incident_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid incident id") from exc
+
+    incident = db.query(models.Incident).filter(models.Incident.id == incident_uuid).first()
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    if incident.status != models.IncidentStatus.OPEN:
+        raise HTTPException(status_code=409, detail="Incident is not open")
+
+    acknowledged_at = datetime.now(timezone.utc)
+    incident.status = models.IncidentStatus.ACKNOWLEDGED
+    incident.acknowledged_at = acknowledged_at
+    if payload.acknowledged_by is not None:
+        incident.acknowledged_by = payload.acknowledged_by
+    incident.updated_at = acknowledged_at
+
+    trace_id = _get_or_create_trace_id(db, incident.id)
+    db.add(
+        models.AuditLog(
+            trace_id=trace_id,
+            incident_id=incident.id,
+            action=models.AuditAction.ACK_RECEIVED,
+            details_json={
+                "acknowledged_by": incident.acknowledged_by,
+                "source": "api",
+                "incident_status": "ACKNOWLEDGED",
+            },
+        )
+    )
+    db.commit()
+
+    return schemas.IncidentLifecycleResponse(
+        action="ack",
+        incident=_serialize_incident(incident),
+    )
+
+@app.post("/incidents/{incident_id}/resolve", response_model=schemas.IncidentLifecycleResponse)
+def resolve_incident(
+    incident_id: str,
+    payload: schemas.ResolveIncidentRequest,
+    db: Session = Depends(get_db),
+):
+    try:
+        incident_uuid = uuid.UUID(incident_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid incident id") from exc
+
+    incident = db.query(models.Incident).filter(models.Incident.id == incident_uuid).first()
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    if incident.status not in {models.IncidentStatus.ACKNOWLEDGED, models.IncidentStatus.ESCALATED}:
+        raise HTTPException(status_code=409, detail="Incident cannot be resolved from current status")
+
+    resolved_at = datetime.now(timezone.utc)
+    incident.status = models.IncidentStatus.RESOLVED
+    incident.updated_at = resolved_at
+
+    trace_id = _get_or_create_trace_id(db, incident.id)
+    db.add(
+        models.AuditLog(
+            trace_id=trace_id,
+            incident_id=incident.id,
+            action=models.AuditAction.CALLBACK_RECEIVED,
+            details_json={
+                "resolved_by": payload.resolved_by,
+                "note": payload.note,
+                "source": "api",
+                "incident_status": "RESOLVED",
+            },
+        )
+    )
+    db.commit()
+
+    return schemas.IncidentLifecycleResponse(
+        action="resolve",
+        incident=_serialize_incident(incident),
+    )
+
 @app.get("/incidents", response_model=schemas.IncidentListResponse)
 def list_incidents(
     status: models.IncidentStatus | None = Query(default=None),

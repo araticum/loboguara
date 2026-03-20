@@ -129,6 +129,17 @@ class IncidentListResponse(BaseModel):
     offset: int
     items: List[IncidentResponse]
 
+class AckIncidentRequest(BaseModel):
+    acknowledged_by: Optional[str] = None
+
+class ResolveIncidentRequest(BaseModel):
+    resolved_by: Optional[str] = None
+    note: Optional[str] = None
+
+class IncidentLifecycleResponse(BaseModel):
+    action: Literal["ack", "resolve"]
+    incident: IncidentResponse
+
 class IncidentStatusCount(BaseModel):
     status: IncidentStatus
     count: int

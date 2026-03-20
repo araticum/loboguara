@@ -176,7 +176,7 @@ class FakeIncidentQuery:
                 if field is None:
                     continue
                 actual = getattr(incident, field)
-                if actual != expected:
+                if actual != expected and str(actual) != str(expected):
                     return False
         return True
 
@@ -212,6 +212,66 @@ class FakeIncidentSession(FakeSession):
         if len(args) == 1 and args[0] is models.Incident:
             return FakeIncidentQuery(self._incidents, count_mode=False)
         return FakeIncidentQuery(self._incidents, count_mode=True)
+
+
+class FakeModelQuery:
+    def __init__(self, items):
+        self._items = list(items)
+        self._filters = []
+        self._ordered = False
+
+    def filter(self, *criteria):
+        self._filters.extend(criteria)
+        return self
+
+    def order_by(self, *criteria):
+        self._ordered = True
+        return self
+
+    def _matches(self, item):
+        for criterion in self._filters:
+            if isinstance(criterion, BinaryExpression):
+                field = getattr(criterion.left, "key", None) or getattr(criterion.left, "name", None)
+                expected = getattr(criterion.right, "value", None)
+                if field is None:
+                    continue
+                actual = getattr(item, field, None)
+                if actual != expected and str(actual) != str(expected):
+                    return False
+        return True
+
+    def _filtered(self):
+        items = [item for item in self._items if self._matches(item)]
+        if self._ordered and items and hasattr(items[0], "created_at"):
+            items.sort(key=lambda item: getattr(item, "created_at"))
+        return items
+
+    def all(self):
+        return self._filtered()
+
+    def first(self):
+        items = self._filtered()
+        return items[0] if items else None
+
+
+class FakeLifecycleSession(FakeIncidentSession):
+    def __init__(self, incidents, audit_logs=None):
+        super().__init__(incidents)
+        self._audit_logs = list(audit_logs or [])
+        self.added_objects = []
+
+    def query(self, *args, **kwargs):
+        if len(args) == 1 and args[0] is models.Incident:
+            return FakeIncidentQuery(self._incidents, count_mode=False)
+        if len(args) == 1 and args[0] is models.AuditLog:
+            return FakeModelQuery(self._audit_logs)
+        return FakeIncidentQuery(self._incidents, count_mode=True)
+
+    def add(self, obj, *args, **kwargs):
+        self.added_objects.append(obj)
+        if isinstance(obj, models.AuditLog):
+            self._audit_logs.append(obj)
+        return None
 
 
 @dataclass
@@ -715,6 +775,124 @@ def test_list_incidents_pagination_and_order(client):
 def test_list_incidents_limit_above_max(client):
     response = client.get(f"/incidents?limit={main.OPS_ENDPOINT_MAX_LIMIT + 1}")
     assert response.status_code == 422
+
+
+def test_ack_incident_success_404_and_409(client):
+    incident = IncidentFixture(
+        id="00000000-0000-0000-0000-00000000a101",
+        external_event_id="evt-ack-1",
+        source="pagerduty",
+        severity="CRITICAL",
+        title="Ack me",
+        message="m",
+        payload_json={"k": "v"},
+        status=models.IncidentStatus.OPEN,
+        matched_rule_id=None,
+        dedupe_key=None,
+        created_at=datetime(2026, 3, 20, 10, 0, 0),
+    )
+    acknowledged = IncidentFixture(
+        id="00000000-0000-0000-0000-00000000a102",
+        external_event_id="evt-ack-2",
+        source="pagerduty",
+        severity="CRITICAL",
+        title="Already acked",
+        message="m",
+        payload_json={"k": "v"},
+        status=models.IncidentStatus.ACKNOWLEDGED,
+        matched_rule_id=None,
+        dedupe_key=None,
+        created_at=datetime(2026, 3, 20, 11, 0, 0),
+        acknowledged_at=datetime(2026, 3, 20, 11, 5, 0),
+        acknowledged_by="existing",
+    )
+    fake_session = FakeLifecycleSession([incident, acknowledged])
+    main.app.dependency_overrides[main.get_db] = lambda: fake_session
+    try:
+        response = client.post(
+            f"/incidents/{incident.id}/ack",
+            json={"acknowledged_by": "alice"},
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["action"] == "ack"
+        assert payload["incident"]["id"] == incident.id
+        assert payload["incident"]["status"] == "ACKNOWLEDGED"
+        assert payload["incident"]["acknowledged_by"] == "alice"
+        assert payload["incident"]["acknowledged_at"] is not None
+        assert any(
+            isinstance(obj, models.AuditLog) and obj.action == models.AuditAction.ACK_RECEIVED
+            for obj in fake_session.added_objects
+        )
+
+        missing = client.post("/incidents/00000000-0000-0000-0000-00000000ffff/ack", json={})
+        assert missing.status_code == 404
+
+        conflict = client.post(f"/incidents/{acknowledged.id}/ack", json={"acknowledged_by": "bob"})
+        assert conflict.status_code == 409
+    finally:
+        main.app.dependency_overrides.pop(main.get_db, None)
+
+
+def test_resolve_incident_success_404_and_409(client):
+    incident = IncidentFixture(
+        id="00000000-0000-0000-0000-00000000b101",
+        external_event_id="evt-res-1",
+        source="grafana",
+        severity="WARN",
+        title="Resolve me",
+        message="m",
+        payload_json={"k": "v"},
+        status=models.IncidentStatus.ACKNOWLEDGED,
+        matched_rule_id=None,
+        dedupe_key=None,
+        created_at=datetime(2026, 3, 20, 12, 0, 0),
+        acknowledged_at=datetime(2026, 3, 20, 12, 2, 0),
+        acknowledged_by="alice",
+    )
+    open_incident = IncidentFixture(
+        id="00000000-0000-0000-0000-00000000b102",
+        external_event_id="evt-res-2",
+        source="grafana",
+        severity="WARN",
+        title="Still open",
+        message="m",
+        payload_json={"k": "v"},
+        status=models.IncidentStatus.OPEN,
+        matched_rule_id=None,
+        dedupe_key=None,
+        created_at=datetime(2026, 3, 20, 13, 0, 0),
+    )
+    fake_session = FakeLifecycleSession([incident, open_incident])
+    main.app.dependency_overrides[main.get_db] = lambda: fake_session
+    try:
+        response = client.post(
+            f"/incidents/{incident.id}/resolve",
+            json={"resolved_by": "bob", "note": "fixed"},
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["action"] == "resolve"
+        assert payload["incident"]["id"] == incident.id
+        assert payload["incident"]["status"] == "RESOLVED"
+        assert any(
+            isinstance(obj, models.AuditLog) and obj.action == models.AuditAction.CALLBACK_RECEIVED
+            for obj in fake_session.added_objects
+        )
+        assert any(
+            isinstance(obj, models.AuditLog)
+            and obj.details_json.get("resolved_by") == "bob"
+            and obj.details_json.get("note") == "fixed"
+            for obj in fake_session.added_objects
+        )
+
+        missing = client.post("/incidents/00000000-0000-0000-0000-00000000ffff/resolve", json={})
+        assert missing.status_code == 404
+
+        conflict = client.post(f"/incidents/{open_incident.id}/resolve", json={"resolved_by": "bob"})
+        assert conflict.status_code == 409
+    finally:
+        main.app.dependency_overrides.pop(main.get_db, None)
 
 
 def test_list_rules_filters_and_pagination(client):
