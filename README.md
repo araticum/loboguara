@@ -34,6 +34,12 @@ The system receives incoming events, evaluates active rules, persists incidents 
 
 ## Setup Local
 
+Copie o template de ambiente:
+
+```bash
+cp .env.example .env
+```
+
 ### Variaveis principais
 
 ```bash
