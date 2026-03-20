@@ -17,6 +17,10 @@ from .engine import evaluate_rules
 from .worker import dispatch_incident, replay_dlq, celery_app
 from .config import (
     APP_BASE_URL,
+    ALERT_ACK_RATE_WARN,
+    ALERT_DLQ_CRIT,
+    ALERT_DLQ_WARN,
+    ALERT_QUEUE_WARN,
     DLQ_QUEUE_NAME,
     METRICS_KEY,
     OPS_ENDPOINT_MAX_LIMIT,
@@ -87,6 +91,14 @@ def _dependency_status(ok: bool, detail: str | None = None) -> schemas.Dependenc
         detail=detail,
     )
 
+def _severity_rank(severity: str) -> int:
+    return {"ok": 0, "info": 1, "warn": 2, "critical": 3}.get(severity, 0)
+
+def _overall_severity(alerts: list[schemas.OperationalAlert]) -> str:
+    if not alerts:
+        return "ok"
+    return max(alerts, key=lambda alert: _severity_rank(alert.severity)).severity
+
 def _require_admin_token(x_admin_token: str | None) -> None:
     configured_token = os.environ.get("SERIEMA_ADMIN_TOKEN")
     if not configured_token:
@@ -132,6 +144,154 @@ def _validate_ops_limit(limit: int) -> None:
             status_code=400,
             detail=f"limit exceeds maximum of {OPS_ENDPOINT_MAX_LIMIT}",
         )
+
+def _calculate_sla_metrics(db: Session, hours: int = 24) -> schemas.SLAMetricsResponse:
+    window_end = datetime.now(timezone.utc)
+    window_start = window_end - timedelta(hours=hours)
+
+    total_incidents = (
+        db.query(func.count(models.Incident.id))
+        .filter(models.Incident.created_at >= window_start)
+        .scalar()
+        or 0
+    )
+
+    acknowledged_incidents = (
+        db.query(func.count(models.Incident.id))
+        .filter(
+            models.Incident.created_at >= window_start,
+            models.Incident.acknowledged_at.isnot(None),
+        )
+        .scalar()
+        or 0
+    )
+
+    average_tta_seconds = (
+        db.query(
+            func.avg(
+                func.extract(
+                    "epoch",
+                    models.Incident.acknowledged_at - models.Incident.created_at,
+                )
+            )
+        )
+        .filter(
+            models.Incident.created_at >= window_start,
+            models.Incident.acknowledged_at.isnot(None),
+        )
+        .scalar()
+    )
+
+    incidents_by_status_rows = (
+        db.query(
+            models.Incident.status,
+            func.count(models.Incident.id),
+        )
+        .filter(models.Incident.created_at >= window_start)
+        .group_by(models.Incident.status)
+        .all()
+    )
+
+    incidents_by_status = [
+        schemas.IncidentStatusCount(status=row[0], count=int(row[1] or 0))
+        for row in incidents_by_status_rows
+    ]
+
+    acknowledgement_rate = (
+        float(acknowledged_incidents) / float(total_incidents)
+        if total_incidents
+        else 0.0
+    )
+
+    return schemas.SLAMetricsResponse(
+        hours=hours,
+        window_start=window_start,
+        window_end=window_end,
+        total_incidents=total_incidents,
+        acknowledged_incidents=acknowledged_incidents,
+        acknowledgement_rate=acknowledgement_rate,
+        average_tta_seconds=float(average_tta_seconds) if average_tta_seconds is not None else None,
+        incidents_by_status=incidents_by_status,
+    )
+
+def _build_operational_alerts(
+    db: Session,
+    queue_metrics: schemas.QueueMetricsResponse,
+    metrics_snapshot: dict[str, object],
+) -> list[schemas.OperationalAlert]:
+    alerts: list[schemas.OperationalAlert] = []
+
+    dlq_size = int(metrics_snapshot.get("dlq_size") or queue_metrics.dlq or 0)
+    if dlq_size >= ALERT_DLQ_CRIT:
+        alerts.append(
+            schemas.OperationalAlert(
+                alert_type="dlq_size",
+                severity="critical",
+                message=f"DLQ size is {dlq_size}, at or above critical threshold {ALERT_DLQ_CRIT}.",
+                actual=dlq_size,
+                threshold=float(ALERT_DLQ_CRIT),
+                metadata={"queue": "dlq"},
+            )
+        )
+    elif dlq_size >= ALERT_DLQ_WARN:
+        alerts.append(
+            schemas.OperationalAlert(
+                alert_type="dlq_size",
+                severity="warn",
+                message=f"DLQ size is {dlq_size}, above warning threshold {ALERT_DLQ_WARN}.",
+                actual=dlq_size,
+                threshold=float(ALERT_DLQ_WARN),
+                metadata={"queue": "dlq"},
+            )
+        )
+
+    for queue_name_label, queue_length in {
+        "dispatch": queue_metrics.dispatch,
+        "voice": queue_metrics.voice,
+    }.items():
+        if queue_length >= ALERT_QUEUE_WARN * 2:
+            severity = "critical"
+        elif queue_length >= ALERT_QUEUE_WARN:
+            severity = "warn"
+        else:
+            continue
+        alerts.append(
+            schemas.OperationalAlert(
+                alert_type=f"queue_backlog:{queue_name_label}",
+                severity=severity,
+                message=(
+                    f"{queue_name_label} queue length is {queue_length}, "
+                    f"at or above threshold {ALERT_QUEUE_WARN}."
+                ),
+                actual=queue_length,
+                threshold=float(ALERT_QUEUE_WARN),
+                metadata={"queue": queue_name_label},
+            )
+        )
+
+    sla_metrics = _calculate_sla_metrics(db, hours=24)
+    ack_rate = sla_metrics.acknowledgement_rate
+    if sla_metrics.total_incidents > 0 and ack_rate < ALERT_ACK_RATE_WARN:
+        severity = "critical" if ack_rate < (ALERT_ACK_RATE_WARN * 0.5) else "warn"
+        alerts.append(
+            schemas.OperationalAlert(
+                alert_type="ack_rate_24h",
+                severity=severity,
+                message=(
+                    f"24h acknowledgement rate is {ack_rate:.3f}, below warning threshold "
+                    f"{ALERT_ACK_RATE_WARN:.3f}."
+                ),
+                actual=ack_rate,
+                threshold=float(ALERT_ACK_RATE_WARN),
+                metadata={
+                    "hours": 24,
+                    "total_incidents": sla_metrics.total_incidents,
+                    "acknowledged_incidents": sla_metrics.acknowledged_incidents,
+                },
+            )
+        )
+
+    return alerts
 
 def _verify_voice_webhook_signature(
     body: bytes,
@@ -387,73 +547,7 @@ def get_sla_metrics(
     hours: int = Query(24, ge=1, le=720),
     db: Session = Depends(get_db),
 ):
-    window_end = datetime.now(timezone.utc)
-    window_start = window_end - timedelta(hours=hours)
-
-    total_incidents = (
-        db.query(func.count(models.Incident.id))
-        .filter(models.Incident.created_at >= window_start)
-        .scalar()
-        or 0
-    )
-
-    acknowledged_incidents = (
-        db.query(func.count(models.Incident.id))
-        .filter(
-            models.Incident.created_at >= window_start,
-            models.Incident.acknowledged_at.isnot(None),
-        )
-        .scalar()
-        or 0
-    )
-
-    average_tta_seconds = (
-        db.query(
-            func.avg(
-                func.extract(
-                    "epoch",
-                    models.Incident.acknowledged_at - models.Incident.created_at,
-                )
-            )
-        )
-        .filter(
-            models.Incident.created_at >= window_start,
-            models.Incident.acknowledged_at.isnot(None),
-        )
-        .scalar()
-    )
-
-    incidents_by_status_rows = (
-        db.query(
-            models.Incident.status,
-            func.count(models.Incident.id),
-        )
-        .filter(models.Incident.created_at >= window_start)
-        .group_by(models.Incident.status)
-        .all()
-    )
-
-    incidents_by_status = [
-        schemas.IncidentStatusCount(status=row[0], count=int(row[1] or 0))
-        for row in incidents_by_status_rows
-    ]
-
-    acknowledgement_rate = (
-        float(acknowledged_incidents) / float(total_incidents)
-        if total_incidents
-        else 0.0
-    )
-
-    return schemas.SLAMetricsResponse(
-        hours=hours,
-        window_start=window_start,
-        window_end=window_end,
-        total_incidents=total_incidents,
-        acknowledged_incidents=acknowledged_incidents,
-        acknowledgement_rate=acknowledgement_rate,
-        average_tta_seconds=float(average_tta_seconds) if average_tta_seconds is not None else None,
-        incidents_by_status=incidents_by_status,
-    )
+    return _calculate_sla_metrics(db, hours=hours)
 
 @app.get("/metrics/queues", response_model=schemas.QueueMetricsResponse)
 def get_queue_metrics():
@@ -476,6 +570,30 @@ def get_ops_metrics():
     return schemas.OpsMetricsResponse(
         redis_key=prefixed_redis_key(METRICS_KEY),
         metrics=parsed_metrics,
+    )
+
+@app.get("/alerts/ops", response_model=schemas.OpsAlertsResponse)
+def get_ops_alerts(db: Session = Depends(get_db)):
+    raw_metrics = redis_conn.hgetall(prefixed_redis_key(METRICS_KEY))
+    parsed_metrics = {
+        str(key.decode("utf-8") if isinstance(key, bytes) else key): _metric_value_from_redis(value)
+        for key, value in raw_metrics.items()
+    }
+    queue_metrics = schemas.QueueMetricsResponse(
+        dispatch=_queue_length(queue_name("dispatch")),
+        voice=_queue_length(queue_name("voice")),
+        telegram=_queue_length(queue_name("telegram")),
+        email=_queue_length(queue_name("email")),
+        escalation=_queue_length(queue_name("escalation")),
+        dlq=_queue_length(prefixed_redis_key(DLQ_QUEUE_NAME)),
+    )
+    alerts = _build_operational_alerts(db, queue_metrics, parsed_metrics)
+    return schemas.OpsAlertsResponse(
+        overall_severity=_overall_severity(alerts),
+        alert_count=len(alerts),
+        alerts=alerts,
+        metrics=parsed_metrics,
+        queue_metrics=queue_metrics,
     )
 
 @app.get("/ops/dlq/preview", response_model=schemas.DLQPreviewResponse)

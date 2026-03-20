@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass
+from datetime import datetime
 
 import pytest
 from fastapi.testclient import TestClient
@@ -262,6 +263,114 @@ def test_metrics_ops(client, monkeypatch):
     assert payload["metrics"]["dlq_size"] == 4
     assert payload["metrics"]["updated_at"] == "2026-03-20T10:00:00+00:00"
     assert payload["metrics"]["note"] == "hello"
+
+
+def test_alerts_ops_without_alerts(client, monkeypatch):
+    fake_session = FakeSession(queries=[])
+    fake_redis = FakeRedis(
+        lengths={
+            main.queue_name("dispatch"): 2,
+            main.queue_name("voice"): 1,
+            main.queue_name("telegram"): 0,
+            main.queue_name("email"): 0,
+            main.queue_name("escalation"): 0,
+            main.prefixed_redis_key(main.DLQ_QUEUE_NAME): 0,
+        },
+        dlq_entries=[],
+        hashes={
+            main.prefixed_redis_key(main.METRICS_KEY): {
+                b"dlq_size": b"0",
+                b"updated_at": b"2026-03-20T10:00:00+00:00",
+            }
+        },
+    )
+    monkeypatch.setattr(main, "redis_conn", fake_redis)
+    main.app.dependency_overrides[main.get_db] = lambda: fake_session
+    monkeypatch.setattr(
+        main,
+        "_calculate_sla_metrics",
+        lambda db, hours=24: schemas.SLAMetricsResponse(
+            hours=24,
+            window_start=datetime(2026, 3, 20, 9, 0, 0),
+            window_end=datetime(2026, 3, 20, 10, 0, 0),
+            total_incidents=10,
+            acknowledged_incidents=9,
+            acknowledgement_rate=0.9,
+            average_tta_seconds=12.0,
+            incidents_by_status=[
+                schemas.IncidentStatusCount(status="OPEN", count=1),
+                schemas.IncidentStatusCount(status="ACKNOWLEDGED", count=9),
+            ],
+        ),
+    )
+
+    response = client.get("/alerts/ops")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["overall_severity"] == "ok"
+    assert payload["alert_count"] == 0
+    assert payload["alerts"] == []
+    assert payload["metrics"]["dlq_size"] == 0
+    assert payload["queue_metrics"]["dispatch"] == 2
+
+
+def test_alerts_ops_with_alerts(client, monkeypatch):
+    fake_session = FakeSession(queries=[])
+    fake_redis = FakeRedis(
+        lengths={
+            main.queue_name("dispatch"): 50,
+            main.queue_name("voice"): 30,
+            main.queue_name("telegram"): 0,
+            main.queue_name("email"): 0,
+            main.queue_name("escalation"): 0,
+            main.prefixed_redis_key(main.DLQ_QUEUE_NAME): 60,
+        },
+        dlq_entries=[],
+        hashes={
+            main.prefixed_redis_key(main.METRICS_KEY): {
+                b"dlq_size": b"60",
+                b"updated_at": b"2026-03-20T10:00:00+00:00",
+            }
+        },
+    )
+    monkeypatch.setattr(main, "redis_conn", fake_redis)
+    main.app.dependency_overrides[main.get_db] = lambda: fake_session
+    monkeypatch.setattr(main, "ALERT_DLQ_WARN", 10)
+    monkeypatch.setattr(main, "ALERT_DLQ_CRIT", 50)
+    monkeypatch.setattr(main, "ALERT_QUEUE_WARN", 20)
+    monkeypatch.setattr(main, "ALERT_ACK_RATE_WARN", 0.8)
+    monkeypatch.setattr(
+        main,
+        "_calculate_sla_metrics",
+        lambda db, hours=24: schemas.SLAMetricsResponse(
+            hours=24,
+            window_start=datetime(2026, 3, 20, 9, 0, 0),
+            window_end=datetime(2026, 3, 20, 10, 0, 0),
+            total_incidents=10,
+            acknowledged_incidents=3,
+            acknowledgement_rate=0.3,
+            average_tta_seconds=120.0,
+            incidents_by_status=[
+                schemas.IncidentStatusCount(status="OPEN", count=7),
+                schemas.IncidentStatusCount(status="ACKNOWLEDGED", count=3),
+            ],
+        ),
+    )
+
+    response = client.get("/alerts/ops")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["overall_severity"] == "critical"
+    assert payload["alert_count"] == 4
+    alert_types = {alert["alert_type"] for alert in payload["alerts"]}
+    assert alert_types == {"dlq_size", "queue_backlog:dispatch", "queue_backlog:voice", "ack_rate_24h"}
+    severities = {alert["severity"] for alert in payload["alerts"]}
+    assert "critical" in severities
+    assert "warn" in severities
+    assert payload["metrics"]["dlq_size"] == 60
+    assert payload["queue_metrics"]["voice"] == 30
 
 
 def test_ops_dlq_preview_and_replay_auth_and_limit(client, monkeypatch):

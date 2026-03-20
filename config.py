@@ -58,6 +58,10 @@ VOICE_WEBHOOK_MAX_SKEW_SECONDS = int(
     os.getenv("VOICE_WEBHOOK_MAX_AGE_SECONDS", "300")
 )
 DLQ_REPLAY_DRY_RUN = os.getenv("SERIEMA_DLQ_REPLAY_DRY_RUN", "false").lower() == "true"
+ALERT_DLQ_WARN = int(os.getenv("SERIEMA_ALERT_DLQ_WARN", "10"))
+ALERT_DLQ_CRIT = int(os.getenv("SERIEMA_ALERT_DLQ_CRIT", "50"))
+ALERT_QUEUE_WARN = int(os.getenv("SERIEMA_ALERT_QUEUE_WARN", "25"))
+ALERT_ACK_RATE_WARN = float(os.getenv("SERIEMA_ALERT_ACK_RATE_WARN", "0.9"))
 
 
 def queue_name(suffix: str) -> str:

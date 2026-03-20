@@ -1,6 +1,6 @@
 from datetime import datetime
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
 import uuid
 from .models import IncidentStatus, NotificationStatus, NotificationChannel, AuditAction
 
@@ -153,3 +153,18 @@ class DLQReplayResponse(BaseModel):
     limit: int
     result: Optional[Dict[str, Any]] = None
     task_id: Optional[str] = None
+
+class OperationalAlert(BaseModel):
+    alert_type: str
+    severity: Literal["info", "warn", "critical"]
+    message: str
+    actual: Optional[float] = None
+    threshold: Optional[float] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+class OpsAlertsResponse(BaseModel):
+    overall_severity: Literal["ok", "info", "warn", "critical"]
+    alert_count: int
+    alerts: List[OperationalAlert]
+    metrics: Dict[str, Any] = Field(default_factory=dict)
+    queue_metrics: QueueMetricsResponse
