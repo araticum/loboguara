@@ -1,0 +1,2 @@
+"""Seriema package root."""
+
