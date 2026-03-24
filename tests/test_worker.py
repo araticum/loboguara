@@ -1284,3 +1284,50 @@ def test_stale_incident_sweeper_escalates_only_old_open_incidents(monkeypatch):
     assert metrics[b"last_status:stale_incident_sweeper"] == b"ok"
     assert b"last_run_at:stale_incident_sweeper" in metrics
     assert int(metrics[b"duration_ms:stale_incident_sweeper"]) >= 0
+
+def test_send_voice_call_signalwire_sets_external_provider_id(monkeypatch):
+    prefix = f"pytest:{uuid.uuid4().hex}"
+    _, redis_client, worker = _fresh_worker(monkeypatch, prefix=prefix, dry_run="true")
+
+    _clear_prefix(redis_client.redis_conn, prefix)
+
+    monkeypatch.setattr(worker, "VOICE_PROVIDER", "signalwire", raising=False)
+    monkeypatch.setattr(worker, "APP_BASE_URL", "https://seriema.example.com", raising=False)
+    monkeypatch.setattr(worker, "VOICE_TWIML_MODE", "dynamic", raising=False)
+
+    captured = {}
+
+    def _fake_signalwire(phone, twiml_url):
+        captured["phone"] = phone
+        captured["twiml_url"] = twiml_url
+        return "CA0000000000000000000000000000SW01"
+
+    monkeypatch.setattr(worker, "_call_signalwire_voice", _fake_signalwire, raising=False)
+
+    db = worker.SessionLocal()
+    try:
+        contact = worker.Contact(name="SignalWire Contact", phone="+5511988888888")
+        db.add(contact)
+        db.commit()
+        db.refresh(contact)
+
+        notification = worker.Notification(
+            incident_id=uuid.uuid4(),
+            contact_id=contact.id,
+            channel=worker.NotificationChannel.VOICE,
+            status=worker.NotificationStatus.PENDING,
+        )
+        db.add(notification)
+        db.commit()
+        db.refresh(notification)
+
+        result = worker._send_voice_call_impl(str(notification.id), "trace-signalwire")
+        assert result["status"] == "sent"
+        assert result["channel"] == "VOICE"
+
+        db.refresh(notification)
+        assert notification.external_provider_id == "CA0000000000000000000000000000SW01"
+        assert captured["phone"] == "+5511988888888"
+        assert captured["twiml_url"].endswith(f"/dispatch/voice/twiml/{notification.id}")
+    finally:
+        db.close()

@@ -120,20 +120,19 @@ def _voice_twiml_url(notification_id: str) -> str:
     return f"{APP_BASE_URL}/dispatch/voice/twiml/{notification_id}"
 
 
-def _call_twilio_voice(contact_phone: str, twiml_url: str) -> str:
-    if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER]):
-        raise RuntimeError("Twilio credentials are not configured")
+def _call_provider_voice(endpoint: str, account_id: str, auth_token: str, from_number: str, contact_phone: str, twiml_url: str, provider_label: str) -> str:
+    if not all([account_id, auth_token, from_number]):
+        raise RuntimeError(f"{provider_label} credentials are not configured")
 
-    endpoint = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Calls.json"
     payload = urlencode(
         {
             "To": contact_phone,
-            "From": TWILIO_FROM_NUMBER,
+            "From": from_number,
             "Url": twiml_url,
             "Method": "POST",
         }
     ).encode("utf-8")
-    basic_auth = base64.b64encode(f"{TWILIO_ACCOUNT_SID}:{TWILIO_AUTH_TOKEN}".encode("utf-8")).decode("ascii")
+    basic_auth = base64.b64encode(f"{account_id}:{auth_token}".encode("utf-8")).decode("ascii")
     request = Request(
         endpoint,
         data=payload,
@@ -149,21 +148,55 @@ def _call_twilio_voice(contact_phone: str, twiml_url: str) -> str:
         parsed = json.loads(body)
         sid = parsed.get("sid")
         if not sid:
-            raise RuntimeError("Twilio response did not include call sid")
+            raise RuntimeError(f"{provider_label} response did not include call sid")
         return str(sid)
+
+
+def _call_twilio_voice(contact_phone: str, twiml_url: str) -> str:
+    endpoint = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Calls.json"
+    return _call_provider_voice(
+        endpoint=endpoint,
+        account_id=TWILIO_ACCOUNT_SID,
+        auth_token=TWILIO_AUTH_TOKEN,
+        from_number=TWILIO_FROM_NUMBER,
+        contact_phone=contact_phone,
+        twiml_url=twiml_url,
+        provider_label="Twilio",
+    )
+
+
+def _call_signalwire_voice(contact_phone: str, twiml_url: str) -> str:
+    if not SIGNALWIRE_SPACE_URL:
+        raise RuntimeError("SignalWire space URL is not configured")
+
+    space = SIGNALWIRE_SPACE_URL.strip().rstrip("/")
+    if not space.startswith("http://") and not space.startswith("https://"):
+        space = f"https://{space}"
+
+    endpoint = f"{space}/api/laml/2010-04-01/Accounts/{SIGNALWIRE_PROJECT_ID}/Calls.json"
+    return _call_provider_voice(
+        endpoint=endpoint,
+        account_id=SIGNALWIRE_PROJECT_ID,
+        auth_token=SIGNALWIRE_API_TOKEN,
+        from_number=SIGNALWIRE_FROM_NUMBER,
+        contact_phone=contact_phone,
+        twiml_url=twiml_url,
+        provider_label="SignalWire",
+    )
 
 
 def _dispatch_voice_provider(db: Session, notification: Notification) -> str | None:
     provider = (VOICE_PROVIDER or "mock").strip().lower()
-    if provider != "twilio":
+    if provider not in {"twilio", "signalwire"}:
         return None
 
     contact = db.query(Contact).filter(Contact.id == notification.contact_id).first()
     if not contact or not contact.phone:
         raise RuntimeError("Contact phone is not available for voice dispatch")
 
-    return _call_twilio_voice(str(contact.phone), _voice_twiml_url(str(notification.id)))
-
+    if provider == "twilio":
+        return _call_twilio_voice(str(contact.phone), _voice_twiml_url(str(notification.id)))
+    return _call_signalwire_voice(str(contact.phone), _voice_twiml_url(str(notification.id)))
 
 def _notification_is_terminal(notification: Notification) -> bool:
     return notification.status in {
@@ -1148,3 +1181,6 @@ def prune_dlq(max_items: int | None = None):
     except Exception:
         _record_periodic_task_heartbeat("prune_dlq", started_monotonic, "error")
         raise
+
+
+
