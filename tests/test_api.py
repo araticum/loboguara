@@ -148,6 +148,7 @@ class IncidentFixture:
     matched_rule_id: str | None
     dedupe_key: str | None
     created_at: datetime
+    service: str | None = None
     updated_at: datetime | None = None
     acknowledged_at: datetime | None = None
     acknowledged_by: str | None = None

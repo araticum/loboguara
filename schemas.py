@@ -91,14 +91,42 @@ def _validate_channel_retry_policy_value(
 
 
 class EventIncoming(BaseModel):
-    source: str
-    external_event_id: str
-    severity: str
-    title: str
-    message: Optional[str] = None
-    payload_json: Optional[Dict[str, Any]] = None
-    schedule_at: Optional[str] = None
-    dedupe_key: Optional[str] = None
+    source: str = Field(
+        ...,
+        description="The source system that generated the event",
+        examples=["aws:cloudwatch"],
+    )
+    external_event_id: str = Field(
+        ...,
+        description="Unique ID of the event in the source system",
+        examples=["cw-alarm-123"],
+    )
+    severity: str = Field(
+        ..., description="The severity level of the event", examples=["CRITICAL"]
+    )
+    service: Optional[str] = Field(
+        None,
+        description="The domain/service associated with the event",
+        examples=["payment-gateway"],
+    )
+    title: str = Field(
+        ...,
+        description="A short, human-readable title",
+        examples=["CPU Utilization High"],
+    )
+    message: Optional[str] = Field(
+        None, description="Detailed message or traceback associated with the event"
+    )
+    payload_json: Optional[Dict[str, Any]] = Field(
+        None, description="Raw data or structured metadata from the source"
+    )
+    schedule_at: Optional[str] = Field(
+        None, description="Optional ISO-8601 timestamp to delay processing"
+    )
+    dedupe_key: Optional[str] = Field(
+        None,
+        description="Optional custom key to prevent duplicate incidents from identical events",
+    )
 
 
 class ContactCreate(BaseModel):
@@ -245,6 +273,7 @@ class IncidentResponse(BaseModel):
     external_event_id: str
     source: str
     severity: str
+    service: Optional[str] = None
     title: str
     message: Optional[str] = None
     payload_json: Optional[Dict[str, Any]] = None

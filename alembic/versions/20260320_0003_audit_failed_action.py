@@ -9,7 +9,6 @@ from alembic import op
 import os
 import sqlalchemy as sa
 
-
 revision = "20260320_0003"
 down_revision = "20260320_0002"
 branch_labels = None
@@ -20,9 +19,7 @@ DB_SCHEMA = os.getenv("SERIEMA_DB_SCHEMA", "seriema")
 
 def upgrade() -> None:
     op.execute(
-        sa.text(
-            f"ALTER TYPE {DB_SCHEMA}.audit_action ADD VALUE IF NOT EXISTS 'FAILED'"
-        )
+        sa.text(f"ALTER TYPE {DB_SCHEMA}.audit_action ADD VALUE IF NOT EXISTS 'FAILED'")
     )
 
 

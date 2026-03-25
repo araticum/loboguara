@@ -35,8 +35,12 @@ def main() -> None:
         db.query(models.Contact).delete()
         db.commit()
 
-        group = models.Group(name=f"oncall-{uuid.uuid4().hex[:8]}", description="Grupo de oncall")
-        contact = models.Contact(name="Alice", email="alice@example.com", phone="+5511999999999")
+        group = models.Group(
+            name=f"oncall-{uuid.uuid4().hex[:8]}", description="Grupo de oncall"
+        )
+        contact = models.Contact(
+            name="Alice", email="alice@example.com", phone="+5511999999999"
+        )
         db.add(group)
         db.add(contact)
         db.commit()
@@ -53,7 +57,10 @@ def main() -> None:
             channels=["voice"],
             requires_ack=False,
             ack_deadline=None,
-            fallback_policy_json={"escalation_group_id": str(group.id), "channels": ["VOICE"]},
+            fallback_policy_json={
+                "escalation_group_id": str(group.id),
+                "channels": ["VOICE"],
+            },
         )
         db.add(rule)
         db.commit()
@@ -77,13 +84,21 @@ def main() -> None:
         incident_id = ingest_body["incident_id"]
         trace_id = ingest_body["trace_id"]
 
-        incident = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
+        incident = (
+            db.query(models.Incident).filter(models.Incident.id == incident_id).first()
+        )
         assert incident is not None
-        notif = db.query(models.Notification).filter(models.Notification.incident_id == incident.id).first()
+        notif = (
+            db.query(models.Notification)
+            .filter(models.Notification.incident_id == incident.id)
+            .first()
+        )
         assert notif is not None
         assert notif.status == models.NotificationStatus.SENT
 
-        callback = client.post(f"/dispatch/voice/callback/{notif.id}", data={"Digits": "1"})
+        callback = client.post(
+            f"/dispatch/voice/callback/{notif.id}", data={"Digits": "1"}
+        )
         assert callback.status_code == 200, callback.text
         db.refresh(incident)
         db.refresh(notif)
@@ -94,7 +109,13 @@ def main() -> None:
                 .order_by(models.AuditLog.created_at.asc())
                 .all()
             )
-            print("DEBUG_CALLBACK", {"incident_status": str(incident.status), "notification_status": str(notif.status)})
+            print(
+                "DEBUG_CALLBACK",
+                {
+                    "incident_status": str(incident.status),
+                    "notification_status": str(notif.status),
+                },
+            )
             print("DEBUG_ACTIONS", [str(log.action) for log in logs])
             print("DEBUG_DETAILS", [log.details_json for log in logs])
         assert incident.status == models.IncidentStatus.ACKNOWLEDGED
@@ -107,9 +128,17 @@ def main() -> None:
         assert duplicate_body["status"] == "ignored"
         assert duplicate_body["reason"] == "duplicate"
 
-        before = db.query(models.Notification).filter(models.Notification.incident_id == incident.id).count()
+        before = (
+            db.query(models.Notification)
+            .filter(models.Notification.incident_id == incident.id)
+            .count()
+        )
         dispatch_incident(str(incident.id), trace_id)
-        after = db.query(models.Notification).filter(models.Notification.incident_id == incident.id).count()
+        after = (
+            db.query(models.Notification)
+            .filter(models.Notification.incident_id == incident.id)
+            .count()
+        )
         assert before == after
 
         incident2 = models.Incident(

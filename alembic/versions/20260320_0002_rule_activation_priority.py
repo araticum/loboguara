@@ -9,7 +9,6 @@ from alembic import op
 import os
 import sqlalchemy as sa
 
-
 # revision identifiers, used by Alembic.
 revision = "20260320_0002"
 down_revision = "20260320_0001"
@@ -23,27 +22,21 @@ def upgrade() -> None:
     op.execute(
         sa.text(
             f'ALTER TABLE "{DB_SCHEMA}".rules '
-            'ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT true'
+            "ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT true"
         )
     )
     op.execute(
         sa.text(
             f'ALTER TABLE "{DB_SCHEMA}".rules '
-            'ADD COLUMN IF NOT EXISTS priority INTEGER NOT NULL DEFAULT 100'
+            "ADD COLUMN IF NOT EXISTS priority INTEGER NOT NULL DEFAULT 100"
         )
     )
 
 
 def downgrade() -> None:
     op.execute(
-        sa.text(
-            f'ALTER TABLE "{DB_SCHEMA}".rules '
-            "DROP COLUMN IF EXISTS priority"
-        )
+        sa.text(f'ALTER TABLE "{DB_SCHEMA}".rules ' "DROP COLUMN IF EXISTS priority")
     )
     op.execute(
-        sa.text(
-            f'ALTER TABLE "{DB_SCHEMA}".rules '
-            "DROP COLUMN IF EXISTS active"
-        )
+        sa.text(f'ALTER TABLE "{DB_SCHEMA}".rules ' "DROP COLUMN IF EXISTS active")
     )

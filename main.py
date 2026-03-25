@@ -8,7 +8,10 @@ import re
 from urllib.parse import urlencode
 from urllib.request import Request as UrlRequest, urlopen
 from datetime import datetime, timezone, timedelta
+from typing import cast as typing_cast, Literal as typing_Literal
 from fastapi import FastAPI, Depends, HTTPException, Request, Response, Query, Header
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import func, text
@@ -55,6 +58,60 @@ VOICE_WEBHOOK_SECRET = os.environ.get("VOICE_WEBHOOK_SECRET")
 app = FastAPI(title="Event SaaS API", version="0.1.0")
 init_observability()
 
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "type": "about:blank",
+            "title": "HTTP Error",
+            "status": exc.status_code,
+            "detail": exc.detail,
+        },
+        headers={"Content-Type": "application/problem+json"},
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    normalized_errors = []
+    for item in exc.errors():
+        normalized = dict(item)
+        ctx = normalized.get("ctx")
+        if isinstance(ctx, dict):
+            normalized["ctx"] = {key: str(value) for key, value in ctx.items()}
+        normalized_errors.append(normalized)
+
+    return JSONResponse(
+        status_code=422,
+        content={
+            "type": "about:blank",
+            "title": "Validation Error",
+            "status": 422,
+            # Keep FastAPI-compatible shape for existing tests/clients.
+            "detail": normalized_errors,
+            "errors": normalized_errors,
+        },
+        headers={"Content-Type": "application/problem+json"},
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    notify_exception(exc, {"path": request.url.path, "method": request.method})
+    return JSONResponse(
+        status_code=500,
+        content={
+            "type": "about:blank",
+            "title": "Internal Server Error",
+            "status": 500,
+            "detail": "An unexpected error occurred.",
+        },
+        headers={"Content-Type": "application/problem+json"},
+    )
+
+
 if SERIEMA_PROMETHEUS_ENABLED:
     try:
         from prometheus_fastapi_instrumentator import Instrumentator
@@ -77,6 +134,7 @@ def _serialize_incident(incident: models.Incident) -> schemas.IncidentResponse:
         external_event_id=incident.external_event_id,
         source=incident.source,
         severity=incident.severity,
+        service=incident.service,
         title=incident.title,
         message=incident.message,
         payload_json=incident.payload_json,
@@ -643,7 +701,7 @@ def health_integrations():
 def ingest_event(event: schemas.EventIncoming, db: Session = Depends(get_db)):
     audit_trace_id = str(uuid.uuid4())
 
-    event_dict = event.dict()
+    event_dict = event.model_dump()
     active_rules = (
         db.query(models.Rule)
         .filter(models.Rule.active.is_(True))
@@ -690,6 +748,7 @@ def ingest_event(event: schemas.EventIncoming, db: Session = Depends(get_db)):
         external_event_id=event.external_event_id,
         source=event.source,
         severity=event.severity,
+        service=event.service,
         title=event.title,
         message=event.message,
         payload_json=event.payload_json,
@@ -702,14 +761,13 @@ def ingest_event(event: schemas.EventIncoming, db: Session = Depends(get_db)):
         db.commit()
     except IntegrityError:
         db.rollback()
-        notify_exception(
-            RuntimeError("duplicate_source_external_event_id"),
-            {
-                "trace_id": audit_trace_id,
-                "source": event.source,
-                "external_event_id": event.external_event_id,
-            },
-            trace_id=audit_trace_id,
+        existing_incident = (
+            db.query(models.Incident)
+            .filter(
+                models.Incident.source == event.source,
+                models.Incident.external_event_id == event.external_event_id,
+            )
+            .first()
         )
         notify_event(
             "seriema.event.duplicate_source_external_event_id",
@@ -717,13 +775,16 @@ def ingest_event(event: schemas.EventIncoming, db: Session = Depends(get_db)):
                 "trace_id": audit_trace_id,
                 "source": event.source,
                 "external_event_id": event.external_event_id,
+                "existing_incident_id": (
+                    str(existing_incident.id) if existing_incident else None
+                ),
             },
             trace_id=audit_trace_id,
         )
         return schemas.EventIngestResponse(
             status="ignored",
             reason="duplicate_source_external_event_id",
-            incident_id=None,
+            incident_id=existing_incident.id if existing_incident else None,
             matched_rule=False,
             trace_id=audit_trace_id,
         )
@@ -1345,6 +1406,55 @@ def get_incident_timeline(
     )
 
 
+@app.get("/incidents/{incident_id}/export")
+def export_incident_timeline(incident_id: str, db: Session = Depends(get_db)):
+    try:
+        incident_uuid = uuid.UUID(incident_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid incident id") from exc
+
+    incident = (
+        db.query(models.Incident).filter(models.Incident.id == incident_uuid).first()
+    )
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    audit_logs = (
+        db.query(models.AuditLog)
+        .filter(models.AuditLog.incident_id == incident_uuid)
+        .order_by(models.AuditLog.created_at.asc())
+        .all()
+    )
+
+    markdown = f"# Incident Report: {incident.title}\n\n"
+    markdown += f"**ID**: `{incident.id}`\n"
+    markdown += f"**Source**: `{incident.source}`\n"
+    markdown += f"**Service**: `{incident.service or 'N/A'}`\n"
+    markdown += f"**Severity**: `{incident.severity}`\n"
+    markdown += f"**Status**: `{incident.status}`\n"
+    markdown += f"**Created At**: `{incident.created_at}`\n"
+    if incident.acknowledged_at:
+        markdown += f"**Acknowledged At**: `{incident.acknowledged_at}` by {incident.acknowledged_by}\n"
+
+    markdown += (
+        f"\n## Description\n{incident.message or 'No description provided.'}\n\n"
+    )
+    markdown += "## Timeline\n\n"
+    for log in audit_logs:
+        markdown += f"- **{log.created_at}** [{log.action.name}] "
+        if log.details_json:
+            markdown += f"`{json.dumps(log.details_json)}`"
+        markdown += "\n"
+
+    return Response(
+        content=markdown,
+        media_type="text/markdown",
+        headers={
+            "Content-Disposition": f"attachment; filename=incident-{incident.id}.md"
+        },
+    )
+
+
 @app.post(
     "/incidents/{incident_id}/ack", response_model=schemas.IncidentLifecycleResponse
 )
@@ -1936,7 +2046,7 @@ def _evaluate_ops_readiness(db: Session) -> schemas.OpsReadinessResponse:
 
     return schemas.OpsReadinessResponse(
         score=score,
-        status=status,
+        status=typing_cast(typing_Literal["green", "yellow", "red"], status),
         checks=checks,
         blockers=blockers,
         evidence=evidence,

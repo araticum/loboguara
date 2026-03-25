@@ -176,8 +176,7 @@ def _get_channel_retry_policy(
         "backoff_max_seconds": CELERY_TASK_RETRY_BACKOFF_MAX,
         "jitter": CELERY_TASK_RETRY_JITTER,
     }
-    db: Session = SessionLocal()
-    try:
+    with SessionLocal() as db:
         notification = (
             db.query(Notification).filter(Notification.id == notification_id).first()
         )
@@ -206,8 +205,6 @@ def _get_channel_retry_policy(
             if key in channel_policy:
                 merged[key] = channel_policy[key]
         return merged
-    finally:
-        db.close()
 
 
 def _call_provider_voice(
@@ -390,10 +387,19 @@ def _record_channel_failure(
     channel: NotificationChannel | str,
 ) -> dict[str, int | bool | str]:
     channel_name = _channel_name(channel)
-    failures = redis_conn.incr(_channel_circuit_failure_key(channel_name))
+    failures = int(redis_conn.incr(_channel_circuit_failure_key(channel_name)))
     opened = failures >= CB_FAILURE_THRESHOLD
     if opened:
         _open_channel_circuit(channel_name)
+        notify_event(
+            "seriema.circuit_breaker.opened",
+            {
+                "channel": channel_name,
+                "failures": failures,
+                "threshold": CB_FAILURE_THRESHOLD,
+            },
+            level="critical",
+        )
     _touch_metrics(
         {
             f"cb_failures:{channel_name.lower()}": failures,
@@ -691,8 +697,7 @@ def _record_final_failure(
     task_name: str,
     payload: dict,
 ) -> None:
-    db: Session = SessionLocal()
-    try:
+    with SessionLocal() as db:
         trace_id = payload.get("trace_id") or str(uuid.uuid4())
         notification_id = payload.get("notification_id")
         incident_id = payload.get("incident_id")
@@ -743,8 +748,6 @@ def _record_final_failure(
             level="error",
             trace_id=trace_id,
         )
-    finally:
-        db.close()
 
 
 def _handle_task_final_failure(
@@ -845,124 +848,127 @@ def _send_notification_channel_impl(
     provider_channel: NotificationChannel | str,
 ):
     channel_name = _channel_name(provider_channel)
-    db: Session = SessionLocal()
-    try:
-        notification = (
-            db.query(Notification)
-            .filter(Notification.id == notification_id)
-            .with_for_update()
-            .first()
-        )
-        if not notification:
-            raise LookupError(f"notification not found: {notification_id}")
-        if _notification_is_terminal(notification):
+    with SessionLocal() as db:
+        try:
+            notification = (
+                db.query(Notification)
+                .filter(Notification.id == notification_id)
+                .with_for_update()
+                .first()
+            )
+            if not notification:
+                raise LookupError(f"notification not found: {notification_id}")
+            if _notification_is_terminal(notification):
+                return {
+                    "status": "already_terminal",
+                    "channel": channel_name,
+                    "notification_id": notification_id,
+                    "trace_id": trace_id,
+                }
+
+            incident = (
+                db.query(Incident)
+                .filter(Incident.id == notification.incident_id)
+                .first()
+            )
+            rule = (
+                db.query(Rule).filter(Rule.id == incident.matched_rule_id).first()
+                if incident and incident.matched_rule_id
+                else None
+            )
+            message_preview = (
+                _render_notification_template(rule, incident, channel_name)
+                if incident
+                else None
+            )
+
+            if channel_name in {
+                "VOICE",
+                "TELEGRAM",
+                "EMAIL",
+            } and _channel_is_circuit_open(channel_name):
+                return {
+                    "status": "skipped_circuit",
+                    "channel": channel_name,
+                    "notification_id": notification_id,
+                    "trace_id": trace_id,
+                }
+
+            rate_limit = None
+            if channel_name in {"VOICE", "TELEGRAM", "EMAIL"}:
+                rate_limit = _channel_rate_limit_exceeded(channel_name)
+                if rate_limit["exceeded"]:
+                    db.add(
+                        AuditLog(
+                            trace_id=trace_id,
+                            incident_id=notification.incident_id,
+                            action=AuditAction.FAILED,
+                            details_json={
+                                "channel": channel_name,
+                                "notification_id": notification_id,
+                                "reason": "rate_limited",
+                                "limit": rate_limit["limit"],
+                                "count": rate_limit["count"],
+                                "window_seconds": rate_limit["window_seconds"],
+                            },
+                        )
+                    )
+                    db.commit()
+
+                    # We record rate-limited deliveries as FAILED because the task did not emit the message.
+                    _increment_metric_counter("tasks_failed_by_channel", channel_name)
+                    return {
+                        "status": "skipped_rate_limit",
+                        "channel": channel_name,
+                        "notification_id": notification_id,
+                        "trace_id": trace_id,
+                        "rate_limit": rate_limit,
+                    }
+
+            provider_id = None
+            if channel_name == "VOICE":
+                provider_id = _dispatch_voice_provider(
+                    db, notification, trace_id=trace_id
+                )
+
+            sent = _mark_notification_sent(
+                db,
+                notification_id,
+                trace_id,
+                channel_name,
+                provider_id=provider_id,
+                message_preview=message_preview,
+                runbook_url=getattr(rule, "runbook_url", None),
+            )
+            if sent:
+                return {
+                    "status": "sent",
+                    "channel": channel_name,
+                    "notification_id": notification_id,
+                    "trace_id": trace_id,
+                }
             return {
                 "status": "already_terminal",
                 "channel": channel_name,
                 "notification_id": notification_id,
                 "trace_id": trace_id,
             }
-
-        incident = (
-            db.query(Incident).filter(Incident.id == notification.incident_id).first()
-        )
-        rule = (
-            db.query(Rule).filter(Rule.id == incident.matched_rule_id).first()
-            if incident and incident.matched_rule_id
-            else None
-        )
-        message_preview = (
-            _render_notification_template(rule, incident, channel_name)
-            if incident
-            else None
-        )
-
-        if channel_name in {"VOICE", "TELEGRAM", "EMAIL"} and _channel_is_circuit_open(
-            channel_name
-        ):
-            return {
-                "status": "skipped_circuit",
-                "channel": channel_name,
-                "notification_id": notification_id,
-                "trace_id": trace_id,
-            }
-
-        rate_limit = None
-        if channel_name in {"VOICE", "TELEGRAM", "EMAIL"}:
-            rate_limit = _channel_rate_limit_exceeded(channel_name)
-            if rate_limit["exceeded"]:
-                db.add(
-                    AuditLog(
-                        trace_id=trace_id,
-                        incident_id=notification.incident_id,
-                        action=AuditAction.FAILED,
-                        details_json={
-                            "channel": channel_name,
-                            "notification_id": notification_id,
-                            "reason": "rate_limited",
-                            "limit": rate_limit["limit"],
-                            "count": rate_limit["count"],
-                            "window_seconds": rate_limit["window_seconds"],
-                        },
-                    )
-                )
-                db.commit()
-
-                # We record rate-limited deliveries as FAILED because the task did not emit the message.
-                _increment_metric_counter("tasks_failed_by_channel", channel_name)
-                return {
-                    "status": "skipped_rate_limit",
-                    "channel": channel_name,
+        except Exception as exc:
+            notify_exception(
+                exc,
+                {
+                    "stage": "send_notification_channel",
                     "notification_id": notification_id,
-                    "trace_id": trace_id,
-                    "rate_limit": rate_limit,
-                }
-
-        provider_id = None
-        if channel_name == "VOICE":
-            provider_id = _dispatch_voice_provider(db, notification, trace_id=trace_id)
-
-        sent = _mark_notification_sent(
-            db,
-            notification_id,
-            trace_id,
-            channel_name,
-            provider_id=provider_id,
-            message_preview=message_preview,
-            runbook_url=getattr(rule, "runbook_url", None),
-        )
-        if sent:
-            return {
-                "status": "sent",
-                "channel": channel_name,
-                "notification_id": notification_id,
-                "trace_id": trace_id,
-            }
-        return {
-            "status": "already_terminal",
-            "channel": channel_name,
-            "notification_id": notification_id,
-            "trace_id": trace_id,
-        }
-    except Exception as exc:
-        notify_exception(
-            exc,
-            {
-                "stage": "send_notification_channel",
-                "notification_id": notification_id,
-                "channel": channel_name,
-            },
-            trace_id=trace_id,
-        )
-        raise
-    finally:
-        db.close()
+                    "channel": channel_name,
+                },
+                trace_id=trace_id,
+            )
+            raise
 
 
 @celery_app.task(name="dispatcher")
 def dispatch_incident(incident_id: str, incoming_trace_id: str):
-    db: Session = SessionLocal()
-    try:
+    with SessionLocal() as db:
         incident = db.query(Incident).filter(Incident.id == incident_id).first()
         if not incident:
             return
@@ -1036,8 +1042,6 @@ def dispatch_incident(incident_id: str, incoming_trace_id: str):
             },
             trace_id=incoming_trace_id,
         )
-    finally:
-        db.close()
 
 
 @celery_app.task(
@@ -1157,8 +1161,7 @@ def handle_escalation(self, incident_id: str, trace_id: str):
 
 
 def _handle_escalation_impl(incident_id: str, trace_id: str):
-    db: Session = SessionLocal()
-    try:
+    with SessionLocal() as db:
         incident = (
             db.query(Incident)
             .filter(Incident.id == incident_id)
@@ -1278,8 +1281,6 @@ def _handle_escalation_impl(incident_id: str, trace_id: str):
 
                 _queue_channel_send(str(notif.id), trace_id, notification_channel)
         return True
-    finally:
-        db.close()
 
 
 @celery_app.task(name="stale_incident_sweeper")
@@ -1400,6 +1401,17 @@ def replay_dlq(limit: int | None = None):
                     candidates.append(entry)
                     if DLQ_REPLAY_DRY_RUN:
                         continue
+
+                    error_str = str(entry.get("error", "")).lower()
+                    if (
+                        "validationerror" in error_str
+                        or "bad request" in error_str
+                        or "400" in error_str
+                    ):
+                        redis_conn.lrem(DLQ_REDIS_KEY, 1, raw_entry)
+                        _refresh_dlq_metric()
+                        continue
+
                     if _replay_entry(entry):
                         redis_conn.lrem(DLQ_REDIS_KEY, 1, raw_entry)
                         replayed += 1

@@ -12,6 +12,7 @@ from sqlalchemy import (
     Enum as SQLEnum,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy.orm import Mapped
 from sqlalchemy.sql import func
 from .database import Base
 
@@ -118,10 +119,11 @@ class Incident(Base):
     external_event_id = Column(String, nullable=False, index=True)
     source = Column(String, nullable=False)
     severity = Column(String, nullable=False)
+    service = Column(String, nullable=True, index=True)
     title = Column(String, nullable=False)
     message = Column(String, nullable=True)
     payload_json = Column(JSONB, nullable=True)
-    status = Column(
+    status: Mapped[IncidentStatus] = Column(  # type: ignore[assignment]
         SQLEnum(IncidentStatus, name="incident_status"),
         nullable=False,
         default=IncidentStatus.OPEN,
@@ -141,10 +143,10 @@ class Notification(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     incident_id = Column(UUID(as_uuid=True), ForeignKey("incidents.id"), nullable=False)
     contact_id = Column(UUID(as_uuid=True), ForeignKey("contacts.id"), nullable=False)
-    channel = Column(
+    channel: Mapped[NotificationChannel] = Column(  # type: ignore[assignment]
         SQLEnum(NotificationChannel, name="notification_channel"), nullable=False
     )
-    status = Column(
+    status: Mapped[NotificationStatus] = Column(  # type: ignore[assignment]
         SQLEnum(NotificationStatus, name="notification_status"),
         nullable=False,
         default=NotificationStatus.PENDING,
@@ -162,7 +164,9 @@ class AuditLog(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     trace_id = Column(String, nullable=False, index=True)
     incident_id = Column(UUID(as_uuid=True), ForeignKey("incidents.id"), nullable=True)
-    action = Column(SQLEnum(AuditAction, name="audit_action"), nullable=False)
+    action: Mapped[AuditAction] = Column(  # type: ignore[assignment]
+        SQLEnum(AuditAction, name="audit_action"), nullable=False
+    )
     details_json = Column(JSONB, nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())

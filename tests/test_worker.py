@@ -299,6 +299,13 @@ class _FakeSession:
     def __init__(self, store):
         self._store = store
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
     @staticmethod
     def _ensure_id(obj):
         if hasattr(obj, "id") and getattr(obj, "id") is None:
@@ -367,7 +374,7 @@ def _fresh_worker(
     worker = importlib.import_module("Seriema.worker")
 
     fake_redis = _FakeRedis()
-    fake_store = {}
+    fake_store: dict[type, list] = {}
 
     monkeypatch.setattr(redis_client, "redis_conn", fake_redis, raising=False)
     monkeypatch.setattr(worker, "redis_conn", fake_redis, raising=False)

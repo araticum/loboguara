@@ -3,6 +3,7 @@ from .config import REDIS_URL, prefixed_redis_key
 
 redis_conn = redis.from_url(REDIS_URL)
 
+
 def is_duplicate(dedupe_key: str, ttl_seconds: int = 300) -> bool:
     if not dedupe_key:
         return False
@@ -12,6 +13,7 @@ def is_duplicate(dedupe_key: str, ttl_seconds: int = 300) -> bool:
     if is_new:
         redis_conn.expire(dedupe_key, ttl_seconds)
     return not is_new
+
 
 def acquire_idempotency_key(key: str, ttl_seconds: int = 3600) -> bool:
     if not key:

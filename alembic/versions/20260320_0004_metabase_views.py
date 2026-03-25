@@ -9,7 +9,6 @@ from alembic import op
 import os
 import sqlalchemy as sa
 
-
 # revision identifiers, used by Alembic.
 revision = "20260320_0004"
 down_revision = "20260320_0003"
@@ -20,9 +19,7 @@ DB_SCHEMA = os.getenv("SERIEMA_DB_SCHEMA", "seriema")
 
 
 def upgrade() -> None:
-    op.execute(
-        sa.text(
-            f"""
+    op.execute(sa.text(f"""
             CREATE OR REPLACE VIEW {DB_SCHEMA}.v_incident_sla AS
             SELECT
                 i.id AS incident_id,
@@ -37,13 +34,9 @@ def upgrade() -> None:
                     ELSE NULL
                 END AS tta_seconds
             FROM {DB_SCHEMA}.incidents i
-            """
-        )
-    )
+            """))
 
-    op.execute(
-        sa.text(
-            f"""
+    op.execute(sa.text(f"""
             CREATE OR REPLACE VIEW {DB_SCHEMA}.v_channel_delivery AS
             SELECT
                 n.id AS notification_id,
@@ -53,13 +46,9 @@ def upgrade() -> None:
                 n.created_at,
                 n.updated_at
             FROM {DB_SCHEMA}.notifications n
-            """
-        )
-    )
+            """))
 
-    op.execute(
-        sa.text(
-            f"""
+    op.execute(sa.text(f"""
             CREATE OR REPLACE VIEW {DB_SCHEMA}.v_ops_summary_24h AS
             WITH recent_incidents AS (
                 SELECT
@@ -85,9 +74,7 @@ def upgrade() -> None:
                     ELSE 0
                 END AS ack_rate
             FROM recent_incidents
-            """
-        )
-    )
+            """))
 
 
 def downgrade() -> None:

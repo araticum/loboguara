@@ -101,6 +101,17 @@ def notify_event(
         except Exception as exc:
             logger.warning("Failed to send Sentry message: %s", exc)
 
+    log_func = getattr(logger, level.lower(), logger.info)
+    import json
+
+    json_log = {
+        "event_name": name,
+        "trace_id": trace_id,
+        "payload": payload,
+        "component": "seriema",
+    }
+    log_func(json.dumps(json_log))
+
     _send_langfuse_event(name=name, payload=payload, level=level, trace_id=trace_id)
 
 
@@ -121,6 +132,17 @@ def notify_exception(
             logger.warning("Failed to send Sentry exception: %s", exc)
 
     merged_payload = {"error": str(error), **payload}
+
+    import json
+
+    json_log = {
+        "event_name": "seriema.exception",
+        "trace_id": trace_id,
+        "payload": merged_payload,
+        "component": "seriema",
+    }
+    logger.error(json.dumps(json_log))
+
     _send_langfuse_event(
         name="seriema.exception",
         payload=merged_payload,

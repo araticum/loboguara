@@ -3,7 +3,6 @@ import sys
 import importlib.util
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 PARENT = ROOT.parent
 
@@ -23,7 +22,9 @@ if "Seriema" not in sys.modules:
         sys.modules["Seriema"] = module
         spec.loader.exec_module(module)
 
-os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:55432/eventsaas")
+os.environ.setdefault(
+    "DATABASE_URL", "postgresql://postgres:postgres@localhost:55432/eventsaas"
+)
 os.environ.setdefault("REDIS_URL", "redis://localhost:56379/0")
 os.environ.setdefault("SERIEMA_DB_SCHEMA", "seriema")
 os.environ.setdefault("SERIEMA_REDIS_DB", "5")
