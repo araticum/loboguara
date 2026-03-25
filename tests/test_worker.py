@@ -365,6 +365,9 @@ def _fresh_worker(
         "DATABASE_URL", "postgresql://postgres:postgres@localhost:55432/eventsaas"
     )
     monkeypatch.setenv("SERIEMA_DB_SCHEMA", "seriema")
+    monkeypatch.setenv("RESEND_API_KEY", "")
+    monkeypatch.setenv("RESEND_FROM_EMAIL", "logs@araticum.net")
+    monkeypatch.setenv("RESEND_TO_EMAIL", "adm@araticum.net")
 
     for name in ["Seriema.config", "Seriema.redis_client", "Seriema.worker"]:
         sys.modules.pop(name, None)
@@ -1534,12 +1537,12 @@ def test_send_telegram_message_falls_back_to_logs_group(monkeypatch):
         db.close()
 
 
-def test_send_email_message_fails_gracefully_when_smtp_missing(monkeypatch):
+def test_send_email_message_fails_gracefully_when_resend_missing(monkeypatch):
     prefix = f"pytest:{uuid.uuid4().hex}"
     _, redis_client, worker = _fresh_worker(monkeypatch, prefix=prefix, dry_run="true")
 
     _clear_prefix(redis_client.redis_conn, prefix)
-    monkeypatch.setattr(worker, "SMTP_HOST", "", raising=False)
+    monkeypatch.setattr(worker, "RESEND_API_KEY", "", raising=False)
 
     db = worker.SessionLocal()
     try:
@@ -1569,57 +1572,44 @@ def test_send_email_message_fails_gracefully_when_smtp_missing(monkeypatch):
 
         result = worker._send_email_message_impl(str(notification.id), "trace-email")
         assert result["status"] == "failed"
-        assert result["error"] == "SMTP is not configured (missing SMTP_HOST)"
+        assert result["error"] == "Resend is not configured (missing RESEND_API_KEY)"
 
         db.refresh(notification)
         assert notification.status == worker.NotificationStatus.FAILED
         assert (
-            notification.error_message == "SMTP is not configured (missing SMTP_HOST)"
+            notification.error_message
+            == "Resend is not configured (missing RESEND_API_KEY)"
         )
     finally:
         db.close()
 
 
-def test_send_email_message_uses_smtp(monkeypatch):
+def test_send_email_message_uses_resend(monkeypatch):
     prefix = f"pytest:{uuid.uuid4().hex}"
     _, redis_client, worker = _fresh_worker(monkeypatch, prefix=prefix, dry_run="true")
 
     _clear_prefix(redis_client.redis_conn, prefix)
-    monkeypatch.setattr(worker, "SMTP_HOST", "smtp.example.com", raising=False)
-    monkeypatch.setattr(worker, "SMTP_PORT", 587, raising=False)
-    monkeypatch.setattr(worker, "SMTP_USER", "mailer", raising=False)
-    monkeypatch.setattr(worker, "SMTP_PASSWORD", "secret", raising=False)
-    monkeypatch.setattr(worker, "SMTP_FROM_EMAIL", "alerts@example.com", raising=False)
-    monkeypatch.setattr(worker, "SMTP_USE_TLS", True, raising=False)
-    monkeypatch.setattr(worker, "SMTP_USE_SSL", False, raising=False)
+    monkeypatch.setattr(worker, "RESEND_API_KEY", "re_test_123", raising=False)
+    monkeypatch.setattr(worker, "RESEND_FROM_EMAIL", "logs@araticum.net", raising=False)
 
     captured = {}
 
-    class _FakeSMTP:
-        def __init__(self, host, port, timeout=None):
-            captured["host"] = host
-            captured["port"] = port
-            captured["timeout"] = timeout
+    class _FakeResponse:
+        status_code = 201
+        text = '{"id":"email-123"}'
 
-        def __enter__(self):
-            return self
+        @staticmethod
+        def json():
+            return {"id": "email-123"}
 
-        def __exit__(self, exc_type, exc, tb):
-            return False
+    def _fake_post(url, headers=None, json=None, timeout=None):
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["json"] = json
+        captured["timeout"] = timeout
+        return _FakeResponse()
 
-        def starttls(self):
-            captured["starttls"] = True
-
-        def login(self, user, password):
-            captured["login"] = (user, password)
-
-        def send_message(self, message):
-            captured["to"] = message["To"]
-            captured["from"] = message["From"]
-            captured["subject"] = message["Subject"]
-            captured["body"] = message.get_content()
-
-    monkeypatch.setattr(worker.smtplib, "SMTP", _FakeSMTP, raising=False)
+    monkeypatch.setattr(worker.httpx, "post", _fake_post, raising=False)
 
     db = worker.SessionLocal()
     try:
@@ -1653,12 +1643,73 @@ def test_send_email_message_uses_smtp(monkeypatch):
 
         db.refresh(notification)
         assert notification.status == worker.NotificationStatus.SENT
-        assert notification.external_provider_id == "smtp:email-real"
-        assert captured["to"] == "ops@example.com"
-        assert captured["from"] == "alerts@example.com"
-        assert captured["subject"] == "email-real"
-        assert "Link:" in captured["body"]
-        assert captured["login"] == ("mailer", "secret")
-        assert captured["starttls"] is True
+        assert notification.external_provider_id == "email-123"
+        assert captured["url"] == "https://api.resend.com/emails"
+        assert captured["headers"]["Authorization"] == "Bearer re_test_123"
+        assert captured["json"]["to"] == ["adm@araticum.net"]
+        assert captured["json"]["from"] == "logs@araticum.net"
+        assert captured["json"]["subject"] == "email-real"
+        assert "Abrir incidente" in captured["json"]["html"]
+    finally:
+        db.close()
+
+
+def test_send_email_message_marks_failed_on_resend_http_error(monkeypatch):
+    prefix = f"pytest:{uuid.uuid4().hex}"
+    _, redis_client, worker = _fresh_worker(monkeypatch, prefix=prefix, dry_run="true")
+
+    _clear_prefix(redis_client.redis_conn, prefix)
+    monkeypatch.setattr(worker, "RESEND_API_KEY", "re_test_123", raising=False)
+
+    class _FakeResponse:
+        status_code = 422
+        text = '{"message":"invalid"}'
+
+        @staticmethod
+        def json():
+            return {"message": "invalid"}
+
+    monkeypatch.setattr(
+        worker.httpx,
+        "post",
+        lambda *args, **kwargs: _FakeResponse(),
+        raising=False,
+    )
+
+    db = worker.SessionLocal()
+    try:
+        contact = worker.Contact(name="Email Contact", email="ops@example.com")
+        incident = worker.Incident(
+            external_event_id=f"evt-{uuid.uuid4().hex}",
+            source="pytest",
+            severity="HIGH",
+            title="email-error",
+            message="payload",
+            status=worker.IncidentStatus.OPEN,
+        )
+        db.add(contact)
+        db.add(incident)
+        db.commit()
+        db.refresh(contact)
+        db.refresh(incident)
+
+        notification = worker.Notification(
+            incident_id=incident.id,
+            contact_id=contact.id,
+            channel=worker.NotificationChannel.EMAIL,
+        )
+        db.add(notification)
+        db.commit()
+        db.refresh(notification)
+
+        result = worker._send_email_message_impl(
+            str(notification.id), "trace-email-error"
+        )
+        assert result["status"] == "failed"
+        assert "Resend email send failed: HTTP 422" in result["error"]
+
+        db.refresh(notification)
+        assert notification.status == worker.NotificationStatus.FAILED
+        assert "Resend email send failed: HTTP 422" in notification.error_message
     finally:
         db.close()

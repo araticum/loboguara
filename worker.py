@@ -2,13 +2,13 @@ import json
 import base64
 import os
 import random
-import smtplib
 import time
 import uuid
 from datetime import datetime, timezone
 from datetime import timedelta
-from email.message import EmailMessage
 from urllib.error import HTTPError, URLError
+
+import httpx
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -54,14 +54,9 @@ from .config import (
     SIGNALWIRE_FROM_NUMBER,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_LOGS_CHAT_ID,
-    SMTP_HOST,
-    SMTP_PORT,
-    SMTP_USER,
-    SMTP_PASSWORD,
-    SMTP_FROM_EMAIL,
-    SMTP_USE_TLS,
-    SMTP_USE_SSL,
-    SMTP_TIMEOUT_SECONDS,
+    RESEND_API_KEY,
+    RESEND_FROM_EMAIL,
+    RESEND_TO_EMAIL,
     OASIS_RADAR_PULL_ENABLED,
     OASIS_RADAR_PULL_FAILURES_KEY,
     OASIS_RADAR_PULL_FAILURE_ALERT_THRESHOLD,
@@ -344,40 +339,49 @@ def _send_telegram_via_bot_api(chat_id: str, text: str) -> str:
     return str(message_id)
 
 
-def _smtp_is_configured() -> bool:
-    return bool(SMTP_HOST.strip())
+def _resend_is_configured() -> bool:
+    return bool(RESEND_API_KEY.strip())
 
 
-def _send_email_via_smtp(
+def _send_email_via_resend(
     *,
     to_email: str,
     subject: str,
-    body: str,
+    html: str,
 ) -> str:
-    if not _smtp_is_configured():
-        raise RuntimeError("SMTP is not configured (missing SMTP_HOST)")
+    if not _resend_is_configured():
+        raise RuntimeError("Resend is not configured (missing RESEND_API_KEY)")
 
-    from_email = (SMTP_FROM_EMAIL or SMTP_USER).strip()
-    if not from_email:
+    response = httpx.post(
+        "https://api.resend.com/emails",
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY.strip()}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "from": RESEND_FROM_EMAIL.strip() or "logs@araticum.net",
+            "to": [RESEND_TO_EMAIL.strip() or to_email],
+            "subject": subject,
+            "html": html,
+        },
+        timeout=15,
+    )
+
+    if response.status_code not in {200, 201}:
         raise RuntimeError(
-            "SMTP sender is not configured (set SMTP_FROM_EMAIL or SMTP_USER)"
+            f"Resend email send failed: HTTP {response.status_code} - {response.text}"
         )
 
-    message = EmailMessage()
-    message["From"] = from_email
-    message["To"] = to_email
-    message["Subject"] = subject
-    message.set_content(body)
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError("Resend email send failed: invalid JSON response") from exc
 
-    smtp_cls = smtplib.SMTP_SSL if SMTP_USE_SSL else smtplib.SMTP
-    with smtp_cls(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS) as smtp:
-        if not SMTP_USE_SSL and SMTP_USE_TLS:
-            smtp.starttls()
-        if SMTP_USER:
-            smtp.login(SMTP_USER, SMTP_PASSWORD)
-        smtp.send_message(message)
+    message_id = payload.get("id")
+    if not message_id:
+        raise RuntimeError("Resend email send failed: response did not include id")
 
-    return f"smtp:{subject}"
+    return str(message_id)
 
 
 def _pull_oasis_radar_impl(limit: int | None = None) -> dict:
@@ -1126,8 +1130,8 @@ def _send_notification_channel_impl(
                 error_message = None
                 if not contact or not contact.email:
                     error_message = "Contact email is not available for email dispatch"
-                elif not _smtp_is_configured():
-                    error_message = "SMTP is not configured (missing SMTP_HOST)"
+                elif not _resend_is_configured():
+                    error_message = "Resend is not configured (missing RESEND_API_KEY)"
                     notify_event(
                         "seriema.worker.email_not_configured",
                         {
@@ -1158,14 +1162,34 @@ def _send_notification_channel_impl(
                     runbook_url
                     or f"{APP_BASE_URL}/incidents/{notification.incident_id}"
                 )
-                body = (message_preview or "Alerta sem conteúdo.") + (
-                    f"\n\nLink: {runbook_url}"
+                html = (
+                    f"<p>{(message_preview or 'Alerta sem conteúdo.')}</p>"
+                    f'<p><a href="{runbook_url}">Abrir incidente</a></p>'
                 )
-                provider_id = _send_email_via_smtp(
-                    to_email=str(contact.email),
-                    subject=(incident.title if incident else "Incident alert"),
-                    body=body,
-                )
+                try:
+                    provider_id = _send_email_via_resend(
+                        to_email=str(contact.email),
+                        subject=(incident.title if incident else "Incident alert"),
+                        html=html,
+                    )
+                except RuntimeError as exc:
+                    error_message = str(exc)
+                    _mark_notification_failed(
+                        db,
+                        notification_id,
+                        trace_id,
+                        channel_name,
+                        error_message,
+                        message_preview=message_preview,
+                        runbook_url=runbook_url,
+                    )
+                    return {
+                        "status": "failed",
+                        "channel": channel_name,
+                        "notification_id": notification_id,
+                        "trace_id": trace_id,
+                        "error": error_message,
+                    }
 
             sent = _mark_notification_sent(
                 db,

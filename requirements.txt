@@ -13,3 +13,4 @@ langfuse
 prometheus-fastapi-instrumentator
 gunicorn
 gevent
+httpx
