@@ -2,10 +2,13 @@ import json
 import base64
 import os
 import random
+import smtplib
 import time
 import uuid
 from datetime import datetime, timezone
 from datetime import timedelta
+from email.message import EmailMessage
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -50,6 +53,16 @@ from .config import (
     SIGNALWIRE_PROJECT_ID,
     SIGNALWIRE_API_TOKEN,
     SIGNALWIRE_FROM_NUMBER,
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_LOGS_CHAT_ID,
+    SMTP_HOST,
+    SMTP_PORT,
+    SMTP_USER,
+    SMTP_PASSWORD,
+    SMTP_FROM_EMAIL,
+    SMTP_USE_TLS,
+    SMTP_USE_SSL,
+    SMTP_TIMEOUT_SECONDS,
     OASIS_RADAR_PULL_ENABLED,
     OASIS_RADAR_PULL_FAILURES_KEY,
     OASIS_RADAR_PULL_FAILURE_ALERT_THRESHOLD,
@@ -286,6 +299,92 @@ def _call_signalwire_voice(contact_phone: str, twiml_url: str) -> str:
         twiml_url=twiml_url,
         provider_label="SignalWire",
     )
+
+
+def _telegram_target_chat_id(contact: Contact | None) -> str:
+    if contact and contact.telegram_id:
+        return str(contact.telegram_id)
+    return str(TELEGRAM_LOGS_CHAT_ID)
+
+
+def _send_telegram_via_bot_api(chat_id: str, text: str) -> str:
+    token = TELEGRAM_BOT_TOKEN.strip()
+    if not token:
+        raise RuntimeError("Telegram bot token is not configured")
+
+    endpoint = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = json.dumps(
+        {
+            "chat_id": str(chat_id),
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+    ).encode("utf-8")
+    request = Request(
+        endpoint,
+        data=payload,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+
+    try:
+        with urlopen(request, timeout=15) as response:
+            body = response.read().decode("utf-8")
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Telegram sendMessage failed: HTTP {exc.code} - {body}"
+        ) from exc
+    except URLError as exc:
+        raise RuntimeError(f"Telegram sendMessage failed: {exc.reason}") from exc
+
+    parsed = json.loads(body)
+    if not parsed.get("ok"):
+        raise RuntimeError(
+            f"Telegram sendMessage failed: {parsed.get('description', 'unknown error')}"
+        )
+
+    result = parsed.get("result") or {}
+    message_id = result.get("message_id")
+    if message_id is None:
+        raise RuntimeError("Telegram sendMessage response did not include message_id")
+    return str(message_id)
+
+
+def _smtp_is_configured() -> bool:
+    return bool(SMTP_HOST.strip())
+
+
+def _send_email_via_smtp(
+    *,
+    to_email: str,
+    subject: str,
+    body: str,
+) -> str:
+    if not _smtp_is_configured():
+        raise RuntimeError("SMTP is not configured (missing SMTP_HOST)")
+
+    from_email = (SMTP_FROM_EMAIL or SMTP_USER).strip()
+    if not from_email:
+        raise RuntimeError(
+            "SMTP sender is not configured (set SMTP_FROM_EMAIL or SMTP_USER)"
+        )
+
+    message = EmailMessage()
+    message["From"] = from_email
+    message["To"] = to_email
+    message["Subject"] = subject
+    message.set_content(body)
+
+    smtp_cls = smtplib.SMTP_SSL if SMTP_USE_SSL else smtplib.SMTP
+    with smtp_cls(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS) as smtp:
+        if not SMTP_USE_SSL and SMTP_USE_TLS:
+            smtp.starttls()
+        if SMTP_USER:
+            smtp.login(SMTP_USER, SMTP_PASSWORD)
+        smtp.send_message(message)
+
+    return f"smtp:{subject}"
 
 
 def _pull_oasis_radar_impl(limit: int | None = None) -> dict:
@@ -870,6 +969,49 @@ def _mark_notification_sent(
     return True
 
 
+def _mark_notification_failed(
+    db: Session,
+    notification_id: str,
+    trace_id: str,
+    provider_channel: str,
+    error_message: str,
+    message_preview: str | None = None,
+    runbook_url: str | None = None,
+) -> bool:
+    notification = (
+        db.query(Notification)
+        .filter(Notification.id == notification_id)
+        .with_for_update()
+        .first()
+    )
+    if not notification:
+        raise LookupError(f"notification not found: {notification_id}")
+    if _notification_is_terminal(notification):
+        return False
+
+    notification.status = NotificationStatus.FAILED
+    notification.error_message = error_message
+    _increment_metric_counter("tasks_failed_by_channel", provider_channel)
+    _record_channel_failure(provider_channel)
+    db.add(
+        AuditLog(
+            trace_id=trace_id,
+            incident_id=notification.incident_id,
+            action=AuditAction.FAILED,
+            details_json={
+                "channel": provider_channel,
+                "notification_id": notification_id,
+                "trace_id": trace_id,
+                "error": error_message,
+                "message_preview": message_preview,
+                "runbook_url": runbook_url,
+            },
+        )
+    )
+    db.commit()
+    return True
+
+
 def _send_notification_channel_impl(
     notification_id: str,
     trace_id: str,
@@ -953,10 +1095,83 @@ def _send_notification_channel_impl(
                         "rate_limit": rate_limit,
                     }
 
+            contact = (
+                db.query(Contact).filter(Contact.id == notification.contact_id).first()
+            )
             provider_id = None
+            runbook_url = getattr(rule, "runbook_url", None)
             if channel_name == "VOICE":
                 provider_id = _dispatch_voice_provider(
                     db, notification, trace_id=trace_id
+                )
+            elif channel_name == "TELEGRAM":
+                error_message = None
+                if not TELEGRAM_BOT_TOKEN.strip():
+                    error_message = "Telegram bot token is not configured"
+                if error_message:
+                    _mark_notification_failed(
+                        db,
+                        notification_id,
+                        trace_id,
+                        channel_name,
+                        error_message,
+                        message_preview=message_preview,
+                        runbook_url=runbook_url,
+                    )
+                    return {
+                        "status": "failed",
+                        "channel": channel_name,
+                        "notification_id": notification_id,
+                        "trace_id": trace_id,
+                        "error": error_message,
+                    }
+                provider_id = _send_telegram_via_bot_api(
+                    _telegram_target_chat_id(contact),
+                    message_preview or "Alerta sem conteúdo.",
+                )
+            elif channel_name == "EMAIL":
+                error_message = None
+                if not contact or not contact.email:
+                    error_message = "Contact email is not available for email dispatch"
+                elif not _smtp_is_configured():
+                    error_message = "SMTP is not configured (missing SMTP_HOST)"
+                    notify_event(
+                        "seriema.worker.email_not_configured",
+                        {
+                            "notification_id": notification_id,
+                            "incident_id": str(notification.incident_id),
+                        },
+                        level="warning",
+                        trace_id=trace_id,
+                    )
+                if error_message:
+                    _mark_notification_failed(
+                        db,
+                        notification_id,
+                        trace_id,
+                        channel_name,
+                        error_message,
+                        message_preview=message_preview,
+                        runbook_url=runbook_url,
+                    )
+                    return {
+                        "status": "failed",
+                        "channel": channel_name,
+                        "notification_id": notification_id,
+                        "trace_id": trace_id,
+                        "error": error_message,
+                    }
+                runbook_url = (
+                    runbook_url
+                    or f"{APP_BASE_URL}/incidents/{notification.incident_id}"
+                )
+                body = (message_preview or "Alerta sem conteúdo.") + (
+                    f"\n\nLink: {runbook_url}"
+                )
+                provider_id = _send_email_via_smtp(
+                    to_email=str(contact.email),
+                    subject=(incident.title if incident else "Incident alert"),
+                    body=body,
                 )
 
             sent = _mark_notification_sent(
@@ -966,7 +1181,7 @@ def _send_notification_channel_impl(
                 channel_name,
                 provider_id=provider_id,
                 message_preview=message_preview,
-                runbook_url=getattr(rule, "runbook_url", None),
+                runbook_url=runbook_url,
             )
             if sent:
                 return {

@@ -1424,3 +1424,241 @@ def test_send_voice_call_signalwire_sets_external_provider_id(monkeypatch):
         assert "trace_id=trace-signalwire" in captured["twiml_url"]
     finally:
         db.close()
+
+
+def test_send_telegram_message_uses_contact_telegram_id(monkeypatch):
+    prefix = f"pytest:{uuid.uuid4().hex}"
+    _, redis_client, worker = _fresh_worker(monkeypatch, prefix=prefix, dry_run="true")
+
+    _clear_prefix(redis_client.redis_conn, prefix)
+    monkeypatch.setattr(worker, "TELEGRAM_BOT_TOKEN", "token-123", raising=False)
+
+    captured = {}
+
+    def _fake_send(chat_id, text):
+        captured["chat_id"] = chat_id
+        captured["text"] = text
+        return "tg-msg-1"
+
+    monkeypatch.setattr(worker, "_send_telegram_via_bot_api", _fake_send, raising=False)
+
+    db = worker.SessionLocal()
+    try:
+        contact = worker.Contact(name="TG Contact", telegram_id="987654321")
+        incident = worker.Incident(
+            external_event_id=f"evt-{uuid.uuid4().hex}",
+            source="pytest",
+            severity="HIGH",
+            title="telegram-test",
+            message="payload",
+            status=worker.IncidentStatus.OPEN,
+        )
+        db.add(contact)
+        db.add(incident)
+        db.commit()
+        db.refresh(contact)
+        db.refresh(incident)
+
+        notification = worker.Notification(
+            incident_id=incident.id,
+            contact_id=contact.id,
+            channel=worker.NotificationChannel.TELEGRAM,
+        )
+        db.add(notification)
+        db.commit()
+        db.refresh(notification)
+
+        result = worker._send_telegram_message_impl(str(notification.id), "trace-tg")
+        assert result["status"] == "sent"
+        assert result["channel"] == "TELEGRAM"
+        assert captured["chat_id"] == "987654321"
+
+        db.refresh(notification)
+        assert notification.status == worker.NotificationStatus.SENT
+        assert notification.external_provider_id == "tg-msg-1"
+    finally:
+        db.close()
+
+
+def test_send_telegram_message_falls_back_to_logs_group(monkeypatch):
+    prefix = f"pytest:{uuid.uuid4().hex}"
+    _, redis_client, worker = _fresh_worker(monkeypatch, prefix=prefix, dry_run="true")
+
+    _clear_prefix(redis_client.redis_conn, prefix)
+    monkeypatch.setattr(worker, "TELEGRAM_BOT_TOKEN", "token-123", raising=False)
+    monkeypatch.setattr(
+        worker, "TELEGRAM_LOGS_CHAT_ID", "-1003623240453", raising=False
+    )
+
+    captured = {}
+
+    def _fake_send(chat_id, text):
+        captured["chat_id"] = chat_id
+        captured["text"] = text
+        return "tg-msg-logs"
+
+    monkeypatch.setattr(worker, "_send_telegram_via_bot_api", _fake_send, raising=False)
+
+    db = worker.SessionLocal()
+    try:
+        contact = worker.Contact(name="TG Broadcast")
+        incident = worker.Incident(
+            external_event_id=f"evt-{uuid.uuid4().hex}",
+            source="pytest",
+            severity="CRITICAL",
+            title="telegram-broadcast",
+            message="payload",
+            status=worker.IncidentStatus.OPEN,
+        )
+        db.add(contact)
+        db.add(incident)
+        db.commit()
+        db.refresh(contact)
+        db.refresh(incident)
+
+        notification = worker.Notification(
+            incident_id=incident.id,
+            contact_id=contact.id,
+            channel=worker.NotificationChannel.TELEGRAM,
+        )
+        db.add(notification)
+        db.commit()
+        db.refresh(notification)
+
+        result = worker._send_telegram_message_impl(
+            str(notification.id), "trace-tg-logs"
+        )
+        assert result["status"] == "sent"
+        assert captured["chat_id"] == "-1003623240453"
+    finally:
+        db.close()
+
+
+def test_send_email_message_fails_gracefully_when_smtp_missing(monkeypatch):
+    prefix = f"pytest:{uuid.uuid4().hex}"
+    _, redis_client, worker = _fresh_worker(monkeypatch, prefix=prefix, dry_run="true")
+
+    _clear_prefix(redis_client.redis_conn, prefix)
+    monkeypatch.setattr(worker, "SMTP_HOST", "", raising=False)
+
+    db = worker.SessionLocal()
+    try:
+        contact = worker.Contact(name="Email Contact", email="ops@example.com")
+        incident = worker.Incident(
+            external_event_id=f"evt-{uuid.uuid4().hex}",
+            source="pytest",
+            severity="HIGH",
+            title="email-test",
+            message="payload",
+            status=worker.IncidentStatus.OPEN,
+        )
+        db.add(contact)
+        db.add(incident)
+        db.commit()
+        db.refresh(contact)
+        db.refresh(incident)
+
+        notification = worker.Notification(
+            incident_id=incident.id,
+            contact_id=contact.id,
+            channel=worker.NotificationChannel.EMAIL,
+        )
+        db.add(notification)
+        db.commit()
+        db.refresh(notification)
+
+        result = worker._send_email_message_impl(str(notification.id), "trace-email")
+        assert result["status"] == "failed"
+        assert result["error"] == "SMTP is not configured (missing SMTP_HOST)"
+
+        db.refresh(notification)
+        assert notification.status == worker.NotificationStatus.FAILED
+        assert (
+            notification.error_message == "SMTP is not configured (missing SMTP_HOST)"
+        )
+    finally:
+        db.close()
+
+
+def test_send_email_message_uses_smtp(monkeypatch):
+    prefix = f"pytest:{uuid.uuid4().hex}"
+    _, redis_client, worker = _fresh_worker(monkeypatch, prefix=prefix, dry_run="true")
+
+    _clear_prefix(redis_client.redis_conn, prefix)
+    monkeypatch.setattr(worker, "SMTP_HOST", "smtp.example.com", raising=False)
+    monkeypatch.setattr(worker, "SMTP_PORT", 587, raising=False)
+    monkeypatch.setattr(worker, "SMTP_USER", "mailer", raising=False)
+    monkeypatch.setattr(worker, "SMTP_PASSWORD", "secret", raising=False)
+    monkeypatch.setattr(worker, "SMTP_FROM_EMAIL", "alerts@example.com", raising=False)
+    monkeypatch.setattr(worker, "SMTP_USE_TLS", True, raising=False)
+    monkeypatch.setattr(worker, "SMTP_USE_SSL", False, raising=False)
+
+    captured = {}
+
+    class _FakeSMTP:
+        def __init__(self, host, port, timeout=None):
+            captured["host"] = host
+            captured["port"] = port
+            captured["timeout"] = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def starttls(self):
+            captured["starttls"] = True
+
+        def login(self, user, password):
+            captured["login"] = (user, password)
+
+        def send_message(self, message):
+            captured["to"] = message["To"]
+            captured["from"] = message["From"]
+            captured["subject"] = message["Subject"]
+            captured["body"] = message.get_content()
+
+    monkeypatch.setattr(worker.smtplib, "SMTP", _FakeSMTP, raising=False)
+
+    db = worker.SessionLocal()
+    try:
+        contact = worker.Contact(name="Email Contact", email="ops@example.com")
+        incident = worker.Incident(
+            external_event_id=f"evt-{uuid.uuid4().hex}",
+            source="pytest",
+            severity="HIGH",
+            title="email-real",
+            message="payload",
+            status=worker.IncidentStatus.OPEN,
+        )
+        db.add(contact)
+        db.add(incident)
+        db.commit()
+        db.refresh(contact)
+        db.refresh(incident)
+
+        notification = worker.Notification(
+            incident_id=incident.id,
+            contact_id=contact.id,
+            channel=worker.NotificationChannel.EMAIL,
+        )
+        db.add(notification)
+        db.commit()
+        db.refresh(notification)
+
+        result = worker._send_email_message_impl(str(notification.id), "trace-email-ok")
+        assert result["status"] == "sent"
+        assert result["channel"] == "EMAIL"
+
+        db.refresh(notification)
+        assert notification.status == worker.NotificationStatus.SENT
+        assert notification.external_provider_id == "smtp:email-real"
+        assert captured["to"] == "ops@example.com"
+        assert captured["from"] == "alerts@example.com"
+        assert captured["subject"] == "email-real"
+        assert "Link:" in captured["body"]
+        assert captured["login"] == ("mailer", "secret")
+        assert captured["starttls"] is True
+    finally:
+        db.close()
