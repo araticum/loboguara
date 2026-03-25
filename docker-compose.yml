@@ -79,7 +79,9 @@ services:
 
   worker:
     build: .
-    command: celery -A Seriema.worker.celery_app worker -B -l info -P gevent -c 100
+    command: >-
+      celery -A Seriema.worker.celery_app worker -B -l info -P gevent -c 100
+      -Q queue:seriema:dispatch,queue:seriema:voice,queue:seriema:telegram,queue:seriema:email,queue:seriema:dlq
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/eventsaas
       REDIS_URL: redis://redis:6379/0

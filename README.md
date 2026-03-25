@@ -86,8 +86,11 @@ py -3 -m uvicorn Seriema.main:app --reload
 ## Executando o Worker
 
 ```bash
-celery -A Seriema.worker.celery_app worker -l info -B
+celery -A Seriema.worker.celery_app worker -l info -B \
+  -Q queue:seriema:dispatch,queue:seriema:voice,queue:seriema:telegram,queue:seriema:email,queue:seriema:dlq
 ```
+
+> Importante: a API publica tasks nas filas prefixadas por `SERIEMA_QUEUE_PREFIX` (por padrao `queue:seriema:*`). Se o worker ouvir apenas `dispatch,voice,...`, os eventos ficam aceitos com `RULE_MATCHED`, mas o dispatcher nunca consome a task.
 
 ## Migracoes Alembic
 

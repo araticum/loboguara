@@ -1020,7 +1020,7 @@ def pull_oasis_radar(
         )
         event = schemas.EventIncoming(
             external_event_id=f"oasis-radar-{timestamp_ns}-{service}",
-            source=f"oasis-radar:{service}",
+            source="oasis-radar",
             severity=severity,
             service=service,
             title=f"Oasis Radar signal from {service}",
