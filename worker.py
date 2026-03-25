@@ -106,6 +106,8 @@ celery_app.conf.update(
         "email_worker": {"queue": queue_name("email")},
         "replay_dlq": {"queue": queue_name(DLQ_QUEUE_NAME)},
         "prune_dlq": {"queue": queue_name(DLQ_QUEUE_NAME)},
+        "oasis_radar_pull_worker": {"queue": queue_name("dispatch")},
+        "queue_metrics_snapshot": {"queue": queue_name("dispatch")},
     },
     beat_schedule={
         "queue-metrics-snapshot": {
