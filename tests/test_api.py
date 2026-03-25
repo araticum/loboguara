@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.sql.elements import BinaryExpression
 
-from Seriema import main, models, schemas
+from Seriema import classifier, main, models, schemas
 
 
 class FakeQuery:
@@ -671,6 +671,84 @@ def test_oasis_radar_severity_mapping():
     assert main._oasis_radar_severity("panic in worker", {}) == "CRITICAL"
     assert main._oasis_radar_severity("warn threshold reached", {}) == "WARN"
     assert main._oasis_radar_severity("normal heartbeat", {}) == "INFO"
+
+
+def test_oasis_radar_classifier_edge_cases():
+    assert classifier.classify_log_line(
+        "postgres",
+        'FATAL: password authentication failed for user "postgres"',
+        {},
+    ) == ("ERROR", "Postgres authentication failed")
+    assert classifier.classify_log_line("redis", "# Server initialized", {}) == (
+        "INFO",
+        "Redis server initialized",
+    )
+    assert classifier.classify_log_line(
+        "seriema-worker",
+        "worker heartbeat stale for 6 minutes",
+        {},
+    ) == ("CRITICAL", "Seriema worker heartbeat missing")
+
+
+def test_oasis_radar_pull_uses_classifier_for_title_and_severity(client, monkeypatch):
+    class RadarRedis:
+        def __init__(self):
+            self.hash = {}
+            self.values = {}
+
+        def hincrby(self, key, field, value):
+            current = int(self.hash.get(field, 0))
+            self.hash[field] = current + int(value)
+            return self.hash[field]
+
+        def hset(self, key, field, value):
+            self.hash[field] = value
+            return 1
+
+        def set(self, key, value):
+            self.values[key] = value
+            return True
+
+    fake_redis = RadarRedis()
+    fake_session = FakeSession(queries=[])
+    main.app.dependency_overrides[main.get_db] = lambda: fake_session
+    monkeypatch.setattr(main, "redis_conn", fake_redis)
+    monkeypatch.setenv("SERIEMA_ADMIN_TOKEN", "test-admin-token")
+    monkeypatch.setattr(
+        main,
+        "_fetch_oasis_radar_entries",
+        lambda query, lookback_seconds, limit: [
+            {
+                "timestamp_ns": "123456789",
+                "line": 'FATAL: password authentication failed for user "postgres"',
+                "labels": {"compose_service": "postgres"},
+            }
+        ],
+    )
+    captured = {}
+
+    def _fake_ingest_event(event, db):
+        captured["severity"] = event.severity
+        captured["title"] = event.title
+        return schemas.EventIngestResponse(
+            status="accepted",
+            incident_id=None,
+            matched_rule=False,
+            trace_id="trace-oasis",
+        )
+
+    monkeypatch.setattr(main, "ingest_event", _fake_ingest_event)
+    monkeypatch.setattr(main, "is_duplicate", lambda key: False)
+    try:
+        response = client.post(
+            "/integrations/oasis-radar/pull",
+            headers={"X-Admin-Token": "test-admin-token"},
+        )
+        assert response.status_code == 200
+        assert captured["severity"] == "ERROR"
+        assert captured["title"] == "Postgres authentication failed"
+    finally:
+        main.app.dependency_overrides.pop(main.get_db, None)
 
 
 def test_oasis_radar_pull_error_updates_metrics(client, monkeypatch):

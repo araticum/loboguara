@@ -20,6 +20,7 @@ from . import models, schemas
 from .database import get_db
 from .redis_client import is_duplicate, redis_conn
 from .engine import evaluate_rules
+from .classifier import classify_log_line
 from .worker import dispatch_incident, replay_dlq, celery_app, get_dlq_replay_report
 from .observability import init_observability, notify_event, notify_exception
 from .config import (
@@ -1015,15 +1016,17 @@ def pull_oasis_radar(
             duplicates += 1
             continue
 
-        severity = _oasis_radar_severity(
-            line, labels if isinstance(labels, dict) else {}
+        severity, title = classify_log_line(
+            service,
+            line,
+            labels if isinstance(labels, dict) else {},
         )
         event = schemas.EventIncoming(
             external_event_id=f"oasis-radar-{timestamp_ns}-{service}",
             source="oasis-radar",
             severity=severity,
             service=service,
-            title=f"Oasis Radar signal from {service}",
+            title=title,
             message=line[:5000],
             payload_json={"labels": labels, "timestamp_ns": timestamp_ns},
             schedule_at=None,
