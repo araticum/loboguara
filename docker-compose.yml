@@ -25,7 +25,7 @@ services:
 
   api:
     build: .
-    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    command: uvicorn Seriema.main:app --host 0.0.0.0 --port 8000
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/eventsaas
       REDIS_URL: redis://redis:6379/0
@@ -50,6 +50,14 @@ services:
       SERIEMA_TASK_RETRY_JITTER: "true"
       SERIEMA_TASK_SOFT_TIME_LIMIT: "30"
       SERIEMA_TASK_TIME_LIMIT: "45"
+      SERIEMA_PROMETHEUS_ENABLED: "false"
+      OASIS_RADAR_ENABLED: "true"
+      OASIS_RADAR_PULL_ENABLED: "true"
+      OASIS_RADAR_LOKI_URL: http://loki:3100
+      OASIS_RADAR_LOGQL_QUERY: '{compose_service=~".+"}'
+      OASIS_RADAR_LOOKBACK_SECONDS: "300"
+      OASIS_RADAR_PULL_LIMIT: "100"
+      OASIS_RADAR_PULL_INTERVAL_SECONDS: "60"
     depends_on:
       postgres:
         condition: service_healthy
@@ -57,3 +65,117 @@ services:
         condition: service_healthy
     ports:
       - "8000:8000"
+
+  worker:
+    build: .
+    command: celery -A Seriema.worker.celery_app worker -B -l info
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/eventsaas
+      REDIS_URL: redis://redis:6379/0
+      SERIEMA_DB_SCHEMA: seriema
+      SERIEMA_REDIS_DB: "5"
+      SERIEMA_REDIS_KEY_PREFIX: seriema
+      SERIEMA_QUEUE_PREFIX: queue:seriema
+      SERIEMA_OPS_MAX_LIMIT: "100"
+      SERIEMA_ADMIN_TOKEN: local-admin-token
+      VOICE_WEBHOOK_SECRET: local-voice-secret
+      VOICE_WEBHOOK_MAX_AGE_SECONDS: "300"
+      SERIEMA_DLQ_REPLAY_DRY_RUN: "true"
+      SERIEMA_METRICS_KEY: metrics:ops
+      SERIEMA_METRICS_TTL_SECONDS: "120"
+      SERIEMA_METRICS_SNAPSHOT_INTERVAL_SECONDS: "60"
+      SERIEMA_DLQ_REPLAY_INTERVAL_SECONDS: "120"
+      SERIEMA_DLQ_QUEUE_NAME: dlq
+      SERIEMA_DLQ_REPLAY_BATCH_SIZE: "10"
+      SERIEMA_TASK_MAX_RETRIES: "5"
+      SERIEMA_TASK_RETRY_BACKOFF: "2"
+      SERIEMA_TASK_RETRY_BACKOFF_MAX: "60"
+      SERIEMA_TASK_RETRY_JITTER: "true"
+      SERIEMA_TASK_SOFT_TIME_LIMIT: "30"
+      SERIEMA_TASK_TIME_LIMIT: "45"
+      OASIS_RADAR_ENABLED: "true"
+      OASIS_RADAR_PULL_ENABLED: "true"
+      OASIS_RADAR_LOKI_URL: http://loki:3100
+      OASIS_RADAR_LOGQL_QUERY: '{compose_service=~".+"}'
+      OASIS_RADAR_LOOKBACK_SECONDS: "300"
+      OASIS_RADAR_PULL_LIMIT: "100"
+      OASIS_RADAR_PULL_INTERVAL_SECONDS: "60"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
+
+  flower:
+    image: mher/flower:2.0.1
+    command:
+      - celery
+      - --broker=redis://redis:6379/0
+      - flower
+      - --address=0.0.0.0
+      - --port=5555
+      - --persistent=True
+      - --db=/data/flower.db
+      - --basic_auth=${FLOWER_BASIC_AUTH:-admin:change-me}
+    ports:
+      - "5555:5555"
+    volumes:
+      - flower-data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  loki:
+    image: grafana/loki:3.0.0
+    command: -config.file=/etc/loki/config.yml
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./monitoring/loki/config.yml:/etc/loki/config.yml:ro
+      - loki-data:/loki
+
+  promtail:
+    image: grafana/promtail:3.0.0
+    command: -config.file=/etc/promtail/config.yml
+    volumes:
+      - ./monitoring/promtail/config.yml:/etc/promtail/config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - promtail-positions:/tmp
+    depends_on:
+      - loki
+
+  grafana:
+    image: grafana/grafana:11.2.2
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - loki
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    profiles: ["observability"]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - api
+
+volumes:
+  flower-data:
+  loki-data:
+  promtail-positions:
+  grafana-data:

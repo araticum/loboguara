@@ -1,5 +1,7 @@
 import json
 import base64
+import os
+import random
 import time
 import uuid
 from datetime import datetime, timezone
@@ -48,6 +50,10 @@ from .config import (
     SIGNALWIRE_PROJECT_ID,
     SIGNALWIRE_API_TOKEN,
     SIGNALWIRE_FROM_NUMBER,
+    OASIS_RADAR_PULL_ENABLED,
+    OASIS_RADAR_PULL_INTERVAL_SECONDS,
+    OASIS_RADAR_PULL_LIMIT,
+    OASIS_RADAR_LOOKBACK_SECONDS,
     queue_name,
     prefixed_redis_key,
 )
@@ -65,6 +71,7 @@ from .models import (
     Rule,
 )
 from .redis_client import redis_conn
+from .observability import init_observability, notify_event, notify_exception
 
 DLQ_REDIS_KEY = prefixed_redis_key(DLQ_QUEUE_NAME)
 DLQ_REPLAY_LOCK_KEY = prefixed_redis_key(f"{DLQ_QUEUE_NAME}:replay:lock")
@@ -72,6 +79,7 @@ METRICS_REDIS_KEY = prefixed_redis_key(METRICS_KEY)
 DLQ_REPLAY_REPORT_KEY = prefixed_redis_key(f"{METRICS_KEY}:dlq_replay_last")
 
 celery_app = Celery("event_saas", broker=REDIS_URL, backend=REDIS_URL)
+init_observability()
 
 celery_app.conf.update(
     task_serializer="json",
@@ -109,6 +117,10 @@ celery_app.conf.update(
             "task": "stale_incident_sweeper",
             "schedule": INCIDENT_STALE_SWEEP_INTERVAL_SECONDS,
         },
+        "oasis-radar-pull": {
+            "task": "oasis_radar_pull_worker",
+            "schedule": OASIS_RADAR_PULL_INTERVAL_SECONDS,
+        },
     },
 )
 
@@ -117,11 +129,85 @@ def _notification_channel_value(channel: NotificationChannel | str) -> str:
     return channel.value if isinstance(channel, NotificationChannel) else str(channel)
 
 
-def _voice_twiml_url(notification_id: str) -> str:
+def _voice_twiml_url(notification_id: str, trace_id: str | None = None) -> str:
     mode = (VOICE_TWIML_MODE or "dynamic").strip().lower()
+    query = f"?trace_id={trace_id}" if trace_id else ""
     if mode == "prerecorded" and VOICE_PRERECORDED_AUDIO_URL:
-        return f"{APP_BASE_URL}/dispatch/voice/twiml/prerecorded/{notification_id}"
-    return f"{APP_BASE_URL}/dispatch/voice/twiml/{notification_id}"
+        return (
+            f"{APP_BASE_URL}/dispatch/voice/twiml/prerecorded/{notification_id}{query}"
+        )
+    return f"{APP_BASE_URL}/dispatch/voice/twiml/{notification_id}{query}"
+
+
+def _render_notification_template(
+    rule: Rule | None,
+    incident: Incident,
+    channel: str,
+) -> str:
+    templates = getattr(rule, "notification_templates_json", None) or {}
+    template = None
+    if isinstance(templates, dict):
+        template = templates.get(channel.upper()) or templates.get(channel.lower())
+
+    if not template:
+        template = "[{severity}] {title} | source={source} | incident={incident_id}"
+
+    values = {
+        "severity": incident.severity,
+        "title": incident.title,
+        "source": incident.source,
+        "message": incident.message or "",
+        "incident_id": str(incident.id),
+        "runbook_url": getattr(rule, "runbook_url", "") or "",
+    }
+    try:
+        return str(template).format(**values)
+    except Exception:
+        return str(template)
+
+
+def _get_channel_retry_policy(
+    notification_id: str,
+    channel_name: str,
+) -> dict[str, int | bool]:
+    defaults = {
+        "max_retries": CELERY_TASK_MAX_RETRIES,
+        "backoff_seconds": CELERY_TASK_RETRY_BACKOFF,
+        "backoff_max_seconds": CELERY_TASK_RETRY_BACKOFF_MAX,
+        "jitter": CELERY_TASK_RETRY_JITTER,
+    }
+    db: Session = SessionLocal()
+    try:
+        notification = (
+            db.query(Notification).filter(Notification.id == notification_id).first()
+        )
+        if not notification:
+            return defaults
+        incident = (
+            db.query(Incident).filter(Incident.id == notification.incident_id).first()
+        )
+        if not incident or not incident.matched_rule_id:
+            return defaults
+        rule = db.query(Rule).filter(Rule.id == incident.matched_rule_id).first()
+        if not rule or not rule.channel_retry_policy_json:
+            return defaults
+
+        policy = rule.channel_retry_policy_json
+        if not isinstance(policy, dict):
+            return defaults
+        channel_policy = policy.get(channel_name.upper()) or policy.get(
+            channel_name.lower()
+        )
+        if not isinstance(channel_policy, dict):
+            return defaults
+
+        merged = dict(defaults)
+        for key in ("max_retries", "backoff_seconds", "backoff_max_seconds", "jitter"):
+            if key in channel_policy:
+                merged[key] = channel_policy[key]
+        return merged
+    finally:
+        db.close()
 
 
 def _call_provider_voice(
@@ -203,7 +289,34 @@ def _call_signalwire_voice(contact_phone: str, twiml_url: str) -> str:
     )
 
 
-def _dispatch_voice_provider(db: Session, notification: Notification) -> str | None:
+def _pull_oasis_radar_impl(limit: int | None = None) -> dict:
+    if not OASIS_RADAR_PULL_ENABLED:
+        return {"status": "skipped", "reason": "disabled"}
+
+    admin_token = os.environ.get("SERIEMA_ADMIN_TOKEN", "")
+    if not admin_token:
+        return {"status": "skipped", "reason": "missing_admin_token"}
+
+    requested_limit = OASIS_RADAR_PULL_LIMIT if limit is None else int(limit)
+    endpoint = (
+        f"{APP_BASE_URL}/integrations/oasis-radar/pull"
+        f"?lookback_seconds={OASIS_RADAR_LOOKBACK_SECONDS}&limit={requested_limit}"
+    )
+    request = Request(
+        endpoint,
+        method="POST",
+        headers={"X-Admin-Token": admin_token},
+    )
+    with urlopen(request, timeout=20) as response:
+        payload = response.read().decode("utf-8")
+        parsed = json.loads(payload)
+    notify_event("seriema.oasis_radar.pull_worker", parsed)
+    return parsed
+
+
+def _dispatch_voice_provider(
+    db: Session, notification: Notification, trace_id: str | None = None
+) -> str | None:
     provider = (VOICE_PROVIDER or "mock").strip().lower()
     if provider not in {"twilio", "signalwire"}:
         return None
@@ -214,10 +327,11 @@ def _dispatch_voice_provider(db: Session, notification: Notification) -> str | N
 
     if provider == "twilio":
         return _call_twilio_voice(
-            str(contact.phone), _voice_twiml_url(str(notification.id))
+            str(contact.phone),
+            _voice_twiml_url(str(notification.id), trace_id=trace_id),
         )
     return _call_signalwire_voice(
-        str(contact.phone), _voice_twiml_url(str(notification.id))
+        str(contact.phone), _voice_twiml_url(str(notification.id), trace_id=trace_id)
     )
 
 
@@ -617,6 +731,18 @@ def _record_final_failure(
             )
         )
         db.commit()
+        notify_event(
+            "seriema.worker.task_final_failure",
+            {
+                "task_name": task_name,
+                "trace_id": trace_id,
+                "notification_id": str(notification_id) if notification_id else None,
+                "incident_id": str(incident_id) if incident_id else None,
+                "error": payload.get("error"),
+            },
+            level="error",
+            trace_id=trace_id,
+        )
     finally:
         db.close()
 
@@ -651,8 +777,15 @@ def _on_task_failure(
     # For autoretry tasks, only send to DLQ when retries are exhausted.
     if isinstance(exception, Retry):
         return
-    request_retries = getattr(getattr(sender, "request", None), "retries", 0)
-    max_retries = getattr(sender, "max_retries", CELERY_TASK_MAX_RETRIES)
+    request_retries = int(getattr(getattr(sender, "request", None), "retries", 0))
+    max_retries = CELERY_TASK_MAX_RETRIES
+    if task_name in {"voice_worker", "telegram_worker", "email_worker"} and args:
+        channel_name = task_name.replace("_worker", "").upper()
+        try:
+            policy = _get_channel_retry_policy(str(args[0]), channel_name)
+            max_retries = int(policy["max_retries"])
+        except Exception:
+            max_retries = CELERY_TASK_MAX_RETRIES
     if max_retries is not None and request_retries < max_retries:
         return
 
@@ -670,6 +803,8 @@ def _mark_notification_sent(
     trace_id: str,
     provider_channel: str,
     provider_id: str | None = None,
+    message_preview: str | None = None,
+    runbook_url: str | None = None,
 ) -> bool:
     notification = (
         db.query(Notification)
@@ -693,6 +828,9 @@ def _mark_notification_sent(
             "channel": provider_channel,
             "notification_id": notification_id,
             "provider_id": provider_id,
+            "trace_id": trace_id,
+            "message_preview": message_preview,
+            "runbook_url": runbook_url,
         },
     )
     db.add(audit)
@@ -724,6 +862,20 @@ def _send_notification_channel_impl(
                 "notification_id": notification_id,
                 "trace_id": trace_id,
             }
+
+        incident = (
+            db.query(Incident).filter(Incident.id == notification.incident_id).first()
+        )
+        rule = (
+            db.query(Rule).filter(Rule.id == incident.matched_rule_id).first()
+            if incident and incident.matched_rule_id
+            else None
+        )
+        message_preview = (
+            _render_notification_template(rule, incident, channel_name)
+            if incident
+            else None
+        )
 
         if channel_name in {"VOICE", "TELEGRAM", "EMAIL"} and _channel_is_circuit_open(
             channel_name
@@ -768,10 +920,16 @@ def _send_notification_channel_impl(
 
         provider_id = None
         if channel_name == "VOICE":
-            provider_id = _dispatch_voice_provider(db, notification)
+            provider_id = _dispatch_voice_provider(db, notification, trace_id=trace_id)
 
         sent = _mark_notification_sent(
-            db, notification_id, trace_id, channel_name, provider_id=provider_id
+            db,
+            notification_id,
+            trace_id,
+            channel_name,
+            provider_id=provider_id,
+            message_preview=message_preview,
+            runbook_url=getattr(rule, "runbook_url", None),
         )
         if sent:
             return {
@@ -786,6 +944,17 @@ def _send_notification_channel_impl(
             "notification_id": notification_id,
             "trace_id": trace_id,
         }
+    except Exception as exc:
+        notify_exception(
+            exc,
+            {
+                "stage": "send_notification_channel",
+                "notification_id": notification_id,
+                "channel": channel_name,
+            },
+            trace_id=trace_id,
+        )
+        raise
     finally:
         db.close()
 
@@ -828,6 +997,9 @@ def dispatch_incident(incident_id: str, incoming_trace_id: str):
 
         for notif in created_notifications:
             channel_value = _notification_channel_value(notif.channel)
+            message_preview = _render_notification_template(
+                rule, incident, channel_value
+            )
             audit = AuditLog(
                 trace_id=incoming_trace_id,
                 incident_id=incident.id,
@@ -835,6 +1007,9 @@ def dispatch_incident(incident_id: str, incoming_trace_id: str):
                 details_json={
                     "channel": channel_value,
                     "notification_id": str(notif.id),
+                    "trace_id": incoming_trace_id,
+                    "message_preview": message_preview,
+                    "runbook_url": getattr(rule, "runbook_url", None),
                 },
             )
             db.add(audit)
@@ -852,6 +1027,15 @@ def dispatch_incident(incident_id: str, incoming_trace_id: str):
                 _queue_channel_send(
                     str(notif.id), incoming_trace_id, NotificationChannel.EMAIL
                 )
+        notify_event(
+            "seriema.worker.dispatch_completed",
+            {
+                "incident_id": str(incident.id),
+                "trace_id": incoming_trace_id,
+                "notifications_queued": len(created_notifications),
+            },
+            trace_id=incoming_trace_id,
+        )
     finally:
         db.close()
 
@@ -859,18 +1043,27 @@ def dispatch_incident(incident_id: str, incoming_trace_id: str):
 @celery_app.task(
     name="voice_worker",
     bind=True,
-    autoretry_for=(Exception,),
-    retry_backoff=CELERY_TASK_RETRY_BACKOFF,
-    retry_backoff_max=CELERY_TASK_RETRY_BACKOFF_MAX,
-    retry_jitter=CELERY_TASK_RETRY_JITTER,
-    max_retries=CELERY_TASK_MAX_RETRIES,
     soft_time_limit=CELERY_TASK_SOFT_TIME_LIMIT,
     time_limit=CELERY_TASK_TIME_LIMIT,
 )
 def send_voice_call(self, notification_id: str, trace_id: str):
-    return _send_notification_channel_impl(
-        notification_id, trace_id, NotificationChannel.VOICE
-    )
+    try:
+        return _send_notification_channel_impl(
+            notification_id, trace_id, NotificationChannel.VOICE
+        )
+    except Exception as exc:
+        policy = _get_channel_retry_policy(notification_id, "VOICE")
+        retries = int(getattr(self.request, "retries", 0))
+        max_retries = int(policy["max_retries"])
+        if retries >= max_retries:
+            raise
+        countdown = min(
+            int(policy["backoff_seconds"]) * (2**retries),
+            int(policy["backoff_max_seconds"]),
+        )
+        if bool(policy["jitter"]):
+            countdown += random.randint(0, max(1, countdown // 3))
+        raise self.retry(exc=exc, countdown=max(1, countdown), max_retries=max_retries)
 
 
 def _send_voice_call_impl(notification_id: str, trace_id: str):
@@ -882,18 +1075,27 @@ def _send_voice_call_impl(notification_id: str, trace_id: str):
 @celery_app.task(
     name="telegram_worker",
     bind=True,
-    autoretry_for=(Exception,),
-    retry_backoff=CELERY_TASK_RETRY_BACKOFF,
-    retry_backoff_max=CELERY_TASK_RETRY_BACKOFF_MAX,
-    retry_jitter=CELERY_TASK_RETRY_JITTER,
-    max_retries=CELERY_TASK_MAX_RETRIES,
     soft_time_limit=CELERY_TASK_SOFT_TIME_LIMIT,
     time_limit=CELERY_TASK_TIME_LIMIT,
 )
 def send_telegram_message(self, notification_id: str, trace_id: str):
-    return _send_notification_channel_impl(
-        notification_id, trace_id, NotificationChannel.TELEGRAM
-    )
+    try:
+        return _send_notification_channel_impl(
+            notification_id, trace_id, NotificationChannel.TELEGRAM
+        )
+    except Exception as exc:
+        policy = _get_channel_retry_policy(notification_id, "TELEGRAM")
+        retries = int(getattr(self.request, "retries", 0))
+        max_retries = int(policy["max_retries"])
+        if retries >= max_retries:
+            raise
+        countdown = min(
+            int(policy["backoff_seconds"]) * (2**retries),
+            int(policy["backoff_max_seconds"]),
+        )
+        if bool(policy["jitter"]):
+            countdown += random.randint(0, max(1, countdown // 3))
+        raise self.retry(exc=exc, countdown=max(1, countdown), max_retries=max_retries)
 
 
 def _send_telegram_message_impl(notification_id: str, trace_id: str):
@@ -905,24 +1107,38 @@ def _send_telegram_message_impl(notification_id: str, trace_id: str):
 @celery_app.task(
     name="email_worker",
     bind=True,
-    autoretry_for=(Exception,),
-    retry_backoff=CELERY_TASK_RETRY_BACKOFF,
-    retry_backoff_max=CELERY_TASK_RETRY_BACKOFF_MAX,
-    retry_jitter=CELERY_TASK_RETRY_JITTER,
-    max_retries=CELERY_TASK_MAX_RETRIES,
     soft_time_limit=CELERY_TASK_SOFT_TIME_LIMIT,
     time_limit=CELERY_TASK_TIME_LIMIT,
 )
 def send_email_message(self, notification_id: str, trace_id: str):
-    return _send_notification_channel_impl(
-        notification_id, trace_id, NotificationChannel.EMAIL
-    )
+    try:
+        return _send_notification_channel_impl(
+            notification_id, trace_id, NotificationChannel.EMAIL
+        )
+    except Exception as exc:
+        policy = _get_channel_retry_policy(notification_id, "EMAIL")
+        retries = int(getattr(self.request, "retries", 0))
+        max_retries = int(policy["max_retries"])
+        if retries >= max_retries:
+            raise
+        countdown = min(
+            int(policy["backoff_seconds"]) * (2**retries),
+            int(policy["backoff_max_seconds"]),
+        )
+        if bool(policy["jitter"]):
+            countdown += random.randint(0, max(1, countdown // 3))
+        raise self.retry(exc=exc, countdown=max(1, countdown), max_retries=max_retries)
 
 
 def _send_email_message_impl(notification_id: str, trace_id: str):
     return _send_notification_channel_impl(
         notification_id, trace_id, NotificationChannel.EMAIL
     )
+
+
+@celery_app.task(name="oasis_radar_pull_worker")
+def oasis_radar_pull_worker(limit: int | None = None):
+    return _pull_oasis_radar_impl(limit=limit)
 
 
 @celery_app.task(

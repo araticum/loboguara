@@ -1,0 +1,34 @@
+{
+  "id": null,
+  "uid": "seriema-overview",
+  "title": "Seriema Overview",
+  "tags": ["seriema", "oasis-radar"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "type": "logs",
+      "title": "All Compose Logs",
+      "gridPos": { "h": 15, "w": 24, "x": 0, "y": 0 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [
+        {
+          "expr": "{compose_service=~\".+\"}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "showLabels": true,
+        "sortOrder": "Descending"
+      }
+    }
+  ]
+}

@@ -46,7 +46,9 @@ SIGNALWIRE_FROM_NUMBER = os.getenv("SIGNALWIRE_FROM_NUMBER", "")
 CELERY_TASK_MAX_RETRIES = int(os.getenv("SERIEMA_TASK_MAX_RETRIES", "5"))
 CELERY_TASK_RETRY_BACKOFF = int(os.getenv("SERIEMA_TASK_RETRY_BACKOFF", "2"))
 CELERY_TASK_RETRY_BACKOFF_MAX = int(os.getenv("SERIEMA_TASK_RETRY_BACKOFF_MAX", "60"))
-CELERY_TASK_RETRY_JITTER = os.getenv("SERIEMA_TASK_RETRY_JITTER", "true").lower() == "true"
+CELERY_TASK_RETRY_JITTER = (
+    os.getenv("SERIEMA_TASK_RETRY_JITTER", "true").lower() == "true"
+)
 CELERY_TASK_SOFT_TIME_LIMIT = int(os.getenv("SERIEMA_TASK_SOFT_TIME_LIMIT", "30"))
 CELERY_TASK_TIME_LIMIT = int(os.getenv("SERIEMA_TASK_TIME_LIMIT", "45"))
 DLQ_QUEUE_NAME = os.getenv("SERIEMA_DLQ_QUEUE_NAME", "dlq")
@@ -60,13 +62,9 @@ METRICS_SNAPSHOT_INTERVAL_SECONDS = int(
 DLQ_REPLAY_INTERVAL_SECONDS = int(
     os.getenv("SERIEMA_DLQ_REPLAY_INTERVAL_SECONDS", "120")
 )
-DLQ_PRUNE_INTERVAL_SECONDS = int(
-    os.getenv("SERIEMA_DLQ_PRUNE_INTERVAL_SECONDS", "300")
-)
+DLQ_PRUNE_INTERVAL_SECONDS = int(os.getenv("SERIEMA_DLQ_PRUNE_INTERVAL_SECONDS", "300"))
 OPS_ENDPOINT_MAX_LIMIT = int(os.getenv("SERIEMA_OPS_MAX_LIMIT", "100"))
-VOICE_WEBHOOK_MAX_SKEW_SECONDS = int(
-    os.getenv("VOICE_WEBHOOK_MAX_AGE_SECONDS", "300")
-)
+VOICE_WEBHOOK_MAX_SKEW_SECONDS = int(os.getenv("VOICE_WEBHOOK_MAX_AGE_SECONDS", "300"))
 DLQ_REPLAY_DRY_RUN = os.getenv("SERIEMA_DLQ_REPLAY_DRY_RUN", "false").lower() == "true"
 DLQ_REPLAY_LOCK_TTL_SECONDS = int(
     os.getenv("SERIEMA_DLQ_REPLAY_LOCK_TTL_SECONDS", "60")
@@ -88,6 +86,31 @@ INCIDENT_STALE_SWEEP_INTERVAL_SECONDS = int(
     os.getenv("SERIEMA_INCIDENT_STALE_SWEEP_INTERVAL_SECONDS", "120")
 )
 
+SENTRY_DSN = os.getenv("SENTRY_DSN", "")
+SENTRY_ENVIRONMENT = os.getenv("SENTRY_ENVIRONMENT", "production")
+SENTRY_RELEASE = os.getenv("SENTRY_RELEASE", "")
+LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY", "")
+LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY", "")
+LANGFUSE_HOST = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
+SERIEMA_PROMETHEUS_ENABLED = (
+    os.getenv("SERIEMA_PROMETHEUS_ENABLED", "false").lower() == "true"
+)
+
+OASIS_RADAR_ENABLED = os.getenv("OASIS_RADAR_ENABLED", "false").lower() == "true"
+OASIS_RADAR_LOKI_URL = os.getenv("OASIS_RADAR_LOKI_URL", "http://oasis-radar-loki:3100")
+OASIS_RADAR_LOGQL_QUERY = os.getenv(
+    "OASIS_RADAR_LOGQL_QUERY",
+    '{compose_service=~".+"}',
+)
+OASIS_RADAR_LOOKBACK_SECONDS = int(os.getenv("OASIS_RADAR_LOOKBACK_SECONDS", "300"))
+OASIS_RADAR_PULL_LIMIT = int(os.getenv("OASIS_RADAR_PULL_LIMIT", "100"))
+OASIS_RADAR_PULL_ENABLED = (
+    os.getenv("OASIS_RADAR_PULL_ENABLED", "false").lower() == "true"
+)
+OASIS_RADAR_PULL_INTERVAL_SECONDS = int(
+    os.getenv("OASIS_RADAR_PULL_INTERVAL_SECONDS", "60")
+)
+
 
 def queue_name(suffix: str) -> str:
     normalized = suffix.strip(":")
@@ -98,4 +121,3 @@ def prefixed_redis_key(key: str) -> str:
     if not key:
         return REDIS_KEY_PREFIX
     return f"{REDIS_KEY_PREFIX}:{key}"
-

@@ -6,29 +6,89 @@ import uuid
 from .models import IncidentStatus, NotificationStatus, NotificationChannel, AuditAction
 
 
-def _validate_fallback_policy_json_value(value: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def _validate_fallback_policy_json_value(
+    value: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
     if value is None:
         return value
     if not isinstance(value, dict):
         raise ValueError("fallback_policy_json must be an object")
 
-    missing_keys = [key for key in ("escalation_group_id", "channels") if key not in value]
+    missing_keys = [
+        key for key in ("escalation_group_id", "channels") if key not in value
+    ]
     if missing_keys:
-        raise ValueError("fallback_policy_json must include escalation_group_id and channels")
+        raise ValueError(
+            "fallback_policy_json must include escalation_group_id and channels"
+        )
 
     escalation_group_id = value.get("escalation_group_id")
     try:
         uuid.UUID(str(escalation_group_id))
     except (TypeError, ValueError) as exc:
-        raise ValueError("fallback_policy_json.escalation_group_id must be a valid UUID") from exc
+        raise ValueError(
+            "fallback_policy_json.escalation_group_id must be a valid UUID"
+        ) from exc
 
     channels = value.get("channels")
     if not isinstance(channels, list) or not channels:
-        raise ValueError("fallback_policy_json.channels must be a non-empty list of strings")
+        raise ValueError(
+            "fallback_policy_json.channels must be a non-empty list of strings"
+        )
     if not all(isinstance(channel, str) for channel in channels):
-        raise ValueError("fallback_policy_json.channels must be a non-empty list of strings")
+        raise ValueError(
+            "fallback_policy_json.channels must be a non-empty list of strings"
+        )
 
     return value
+
+
+def _validate_channel_retry_policy_value(
+    value: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if value is None:
+        return value
+    if not isinstance(value, dict):
+        raise ValueError("channel_retry_policy_json must be an object")
+
+    allowed_channels = {"VOICE", "EMAIL", "TELEGRAM"}
+    for channel, policy in value.items():
+        normalized = str(channel).upper()
+        if normalized not in allowed_channels:
+            raise ValueError(
+                "channel_retry_policy_json keys must be VOICE, EMAIL or TELEGRAM"
+            )
+        if not isinstance(policy, dict):
+            raise ValueError("channel_retry_policy_json values must be objects")
+
+        max_retries = policy.get("max_retries")
+        backoff_seconds = policy.get("backoff_seconds")
+        backoff_max_seconds = policy.get("backoff_max_seconds")
+        jitter = policy.get("jitter")
+
+        if max_retries is not None and (
+            not isinstance(max_retries, int) or max_retries < 0
+        ):
+            raise ValueError(
+                "channel_retry_policy_json.max_retries must be an integer >= 0"
+            )
+        if backoff_seconds is not None and (
+            not isinstance(backoff_seconds, int) or backoff_seconds < 1
+        ):
+            raise ValueError(
+                "channel_retry_policy_json.backoff_seconds must be an integer >= 1"
+            )
+        if backoff_max_seconds is not None and (
+            not isinstance(backoff_max_seconds, int) or backoff_max_seconds < 1
+        ):
+            raise ValueError(
+                "channel_retry_policy_json.backoff_max_seconds must be an integer >= 1"
+            )
+        if jitter is not None and not isinstance(jitter, bool):
+            raise ValueError("channel_retry_policy_json.jitter must be boolean")
+
+    return value
+
 
 class EventIncoming(BaseModel):
     source: str
@@ -40,6 +100,7 @@ class EventIncoming(BaseModel):
     schedule_at: Optional[str] = None
     dedupe_key: Optional[str] = None
 
+
 class ContactCreate(BaseModel):
     name: str
     email: Optional[str] = None
@@ -47,8 +108,10 @@ class ContactCreate(BaseModel):
     whatsapp: Optional[str] = None
     telegram_id: Optional[str] = None
 
+
 class ContactResponse(ContactCreate):
     id: uuid.UUID
+
 
 class ContactUpdate(BaseModel):
     name: Optional[str] = None
@@ -57,22 +120,27 @@ class ContactUpdate(BaseModel):
     whatsapp: Optional[str] = None
     telegram_id: Optional[str] = None
 
+
 class ContactListResponse(BaseModel):
     total: int
     limit: int
     offset: int
     items: List[ContactResponse]
 
+
 class GroupCreate(BaseModel):
     name: str
     description: Optional[str] = None
 
+
 class GroupResponse(GroupCreate):
     id: uuid.UUID
+
 
 class GroupUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
+
 
 class GroupListResponse(BaseModel):
     total: int
@@ -80,12 +148,15 @@ class GroupListResponse(BaseModel):
     offset: int
     items: List[GroupResponse]
 
+
 class GroupMemberCreate(BaseModel):
     contact_id: uuid.UUID
+
 
 class GroupMemberResponse(BaseModel):
     group_id: uuid.UUID
     contact_id: uuid.UUID
+
 
 class RuleCreate(BaseModel):
     rule_name: str
@@ -97,14 +168,26 @@ class RuleCreate(BaseModel):
     requires_ack: bool = False
     ack_deadline: Optional[int] = None
     fallback_policy_json: Optional[Dict[str, Any]] = None
+    dedupe_window_seconds: Optional[int] = None
+    dedupe_fields_json: Optional[List[str]] = None
+    notification_templates_json: Optional[Dict[str, str]] = None
+    runbook_url: Optional[str] = None
+    channel_retry_policy_json: Optional[Dict[str, Any]] = None
 
     @field_validator("fallback_policy_json")
     @classmethod
     def validate_fallback_policy_json(cls, value):
         return _validate_fallback_policy_json_value(value)
 
+    @field_validator("channel_retry_policy_json")
+    @classmethod
+    def validate_channel_retry_policy_json(cls, value):
+        return _validate_channel_retry_policy_value(value)
+
+
 class RuleResponse(RuleCreate):
     id: uuid.UUID
+
 
 class RuleSimulationResponse(BaseModel):
     rule_id: uuid.UUID
@@ -113,6 +196,7 @@ class RuleSimulationResponse(BaseModel):
     reasons: List[str] = Field(default_factory=list)
     payload: Dict[str, Any] = Field(default_factory=dict)
     condition_json: Dict[str, Any] = Field(default_factory=dict)
+
 
 class RuleUpdate(BaseModel):
     rule_name: Optional[str] = None
@@ -124,11 +208,22 @@ class RuleUpdate(BaseModel):
     requires_ack: Optional[bool] = None
     ack_deadline: Optional[int] = None
     fallback_policy_json: Optional[Dict[str, Any]] = None
+    dedupe_window_seconds: Optional[int] = None
+    dedupe_fields_json: Optional[List[str]] = None
+    notification_templates_json: Optional[Dict[str, str]] = None
+    runbook_url: Optional[str] = None
+    channel_retry_policy_json: Optional[Dict[str, Any]] = None
 
     @field_validator("fallback_policy_json")
     @classmethod
     def validate_fallback_policy_json(cls, value):
         return _validate_fallback_policy_json_value(value)
+
+    @field_validator("channel_retry_policy_json")
+    @classmethod
+    def validate_channel_retry_policy_json(cls, value):
+        return _validate_channel_retry_policy_value(value)
+
 
 class RuleListResponse(BaseModel):
     total: int
@@ -136,12 +231,14 @@ class RuleListResponse(BaseModel):
     offset: int
     items: List[RuleResponse]
 
+
 class EventIngestResponse(BaseModel):
     status: str
     incident_id: Optional[uuid.UUID] = None
     matched_rule: bool = False
     trace_id: str
     reason: Optional[str] = None
+
 
 class IncidentResponse(BaseModel):
     id: uuid.UUID
@@ -159,6 +256,7 @@ class IncidentResponse(BaseModel):
     acknowledged_at: Optional[datetime] = None
     acknowledged_by: Optional[str] = None
 
+
 class NotificationResponse(BaseModel):
     id: uuid.UUID
     incident_id: uuid.UUID
@@ -170,6 +268,7 @@ class NotificationResponse(BaseModel):
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
+
 class AuditLogResponse(BaseModel):
     id: uuid.UUID
     trace_id: str
@@ -178,9 +277,11 @@ class AuditLogResponse(BaseModel):
     details_json: Optional[Dict[str, Any]] = None
     created_at: Optional[datetime] = None
 
+
 class IncidentDetailsResponse(BaseModel):
     incident: IncidentResponse
     logs: List[AuditLogResponse]
+
 
 class IncidentTimelineResponse(BaseModel):
     total: int
@@ -188,26 +289,32 @@ class IncidentTimelineResponse(BaseModel):
     offset: int
     items: List[AuditLogResponse]
 
+
 class IncidentListResponse(BaseModel):
     total: int
     limit: int
     offset: int
     items: List[IncidentResponse]
 
+
 class AckIncidentRequest(BaseModel):
     acknowledged_by: Optional[str] = None
+
 
 class ResolveIncidentRequest(BaseModel):
     resolved_by: Optional[str] = None
     note: Optional[str] = None
 
+
 class IncidentLifecycleResponse(BaseModel):
     action: Literal["ack", "resolve"]
     incident: IncidentResponse
 
+
 class IncidentStatusCount(BaseModel):
     status: IncidentStatus
     count: int
+
 
 class SLAMetricsResponse(BaseModel):
     hours: int
@@ -219,6 +326,7 @@ class SLAMetricsResponse(BaseModel):
     average_tta_seconds: Optional[float] = None
     incidents_by_status: List[IncidentStatusCount]
 
+
 class QueueMetricsResponse(BaseModel):
     dispatch: int
     voice: int
@@ -227,18 +335,33 @@ class QueueMetricsResponse(BaseModel):
     escalation: int
     dlq: int
 
+
 class DependencyStatusDetail(BaseModel):
     status: str
     detail: Optional[str] = None
+
 
 class HealthDepsResponse(BaseModel):
     postgres: DependencyStatusDetail
     redis: DependencyStatusDetail
     overall: str
 
+
+class IntegrationStatusDetail(BaseModel):
+    name: str
+    status: Literal["ok", "down", "disabled"]
+    detail: Optional[str] = None
+
+
+class HealthIntegrationsResponse(BaseModel):
+    overall: Literal["ok", "degraded", "down"]
+    integrations: List[IntegrationStatusDetail]
+
+
 class OpsMetricsResponse(BaseModel):
     redis_key: str
     metrics: Dict[str, Any]
+
 
 class DLQPreviewItem(BaseModel):
     task_name: str
@@ -250,16 +373,19 @@ class DLQPreviewItem(BaseModel):
     kwargs: Dict[str, Any] = Field(default_factory=dict)
     failed_at: Optional[str] = None
 
+
 class DLQPreviewResponse(BaseModel):
     limit: int
     total_items: int
     items: List[DLQPreviewItem]
+
 
 class DLQReplayResponse(BaseModel):
     status: str
     limit: int
     result: Optional[Dict[str, Any]] = None
     task_id: Optional[str] = None
+
 
 class DLQReplayReportResponse(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -274,6 +400,7 @@ class DLQReplayReportResponse(BaseModel):
     dry_run: bool = False
     locked: bool = False
 
+
 class OpsIntegrationStatusResponse(BaseModel):
     enums_ok: bool
     fallback_contract_ok: bool
@@ -284,10 +411,12 @@ class OpsIntegrationStatusResponse(BaseModel):
     dlq_reporting_signal: bool
     evidence: Dict[str, Any] = Field(default_factory=dict)
 
+
 class OpsReadinessCheck(BaseModel):
     name: str
     passed: bool
     details: str
+
 
 class OpsReadinessResponse(BaseModel):
     score: int
@@ -296,6 +425,7 @@ class OpsReadinessResponse(BaseModel):
     blockers: List[str] = Field(default_factory=list)
     evidence: Dict[str, Any] = Field(default_factory=dict)
 
+
 class OperationalAlert(BaseModel):
     alert_type: str
     severity: Literal["info", "warn", "critical"]
@@ -303,6 +433,7 @@ class OperationalAlert(BaseModel):
     actual: Optional[float] = None
     threshold: Optional[float] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
+
 
 class OpsAlertsResponse(BaseModel):
     overall_severity: Literal["ok", "info", "warn", "critical"]

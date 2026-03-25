@@ -8,3 +8,6 @@ pydantic
 pydantic-settings
 alembic
 python-multipart
+sentry-sdk
+langfuse
+prometheus-fastapi-instrumentator

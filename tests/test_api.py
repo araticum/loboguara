@@ -346,6 +346,11 @@ class RuleFixture:
     requires_ack: bool
     ack_deadline: int | None
     fallback_policy_json: dict | None
+    dedupe_window_seconds: int | None = None
+    dedupe_fields_json: list[str] | None = None
+    notification_templates_json: dict | None = None
+    runbook_url: str | None = None
+    channel_retry_policy_json: dict | None = None
 
 
 @dataclass

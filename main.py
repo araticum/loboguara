@@ -5,6 +5,8 @@ import hmac
 import os
 import time
 import re
+from urllib.parse import urlencode
+from urllib.request import Request as UrlRequest, urlopen
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Depends, HTTPException, Request, Response, Query, Header
 from sqlalchemy.orm import Session
@@ -15,6 +17,7 @@ from .database import get_db
 from .redis_client import is_duplicate, redis_conn
 from .engine import evaluate_rules
 from .worker import dispatch_incident, replay_dlq, celery_app, get_dlq_replay_report
+from .observability import init_observability, notify_event, notify_exception
 from .config import (
     APP_BASE_URL,
     ALERT_ACK_RATE_WARN,
@@ -24,8 +27,25 @@ from .config import (
     DLQ_QUEUE_NAME,
     METRICS_KEY,
     OPS_ENDPOINT_MAX_LIMIT,
+    SERIEMA_PROMETHEUS_ENABLED,
+    SIGNALWIRE_API_TOKEN,
+    SIGNALWIRE_FROM_NUMBER,
+    SIGNALWIRE_PROJECT_ID,
+    SIGNALWIRE_SPACE_URL,
+    SENTRY_DSN,
+    LANGFUSE_PUBLIC_KEY,
+    LANGFUSE_SECRET_KEY,
+    TWILIO_ACCOUNT_SID,
+    TWILIO_AUTH_TOKEN,
+    TWILIO_FROM_NUMBER,
+    VOICE_PROVIDER,
     VOICE_PRERECORDED_AUDIO_URL,
     VOICE_WEBHOOK_MAX_SKEW_SECONDS,
+    OASIS_RADAR_ENABLED,
+    OASIS_RADAR_LOKI_URL,
+    OASIS_RADAR_LOGQL_QUERY,
+    OASIS_RADAR_LOOKBACK_SECONDS,
+    OASIS_RADAR_PULL_LIMIT,
     queue_name,
     prefixed_redis_key,
 )
@@ -33,6 +53,23 @@ from .config import (
 VOICE_WEBHOOK_SECRET = os.environ.get("VOICE_WEBHOOK_SECRET")
 
 app = FastAPI(title="Event SaaS API", version="0.1.0")
+init_observability()
+
+if SERIEMA_PROMETHEUS_ENABLED:
+    try:
+        from prometheus_fastapi_instrumentator import Instrumentator
+
+        Instrumentator().instrument(app).expose(app)
+        notify_event(
+            "seriema.prometheus.enabled",
+            {"metrics_path": "/metrics"},
+        )
+    except Exception as exc:
+        notify_exception(
+            exc,
+            {"stage": "prometheus_instrumentation"},
+        )
+
 
 def _serialize_incident(incident: models.Incident) -> schemas.IncidentResponse:
     return schemas.IncidentResponse(
@@ -52,6 +89,7 @@ def _serialize_incident(incident: models.Incident) -> schemas.IncidentResponse:
         acknowledged_by=incident.acknowledged_by,
     )
 
+
 def _serialize_audit(audit: models.AuditLog) -> schemas.AuditLogResponse:
     return schemas.AuditLogResponse(
         id=audit.id,
@@ -61,6 +99,7 @@ def _serialize_audit(audit: models.AuditLog) -> schemas.AuditLogResponse:
         details_json=audit.details_json,
         created_at=audit.created_at,
     )
+
 
 def _serialize_rule(rule: models.Rule) -> schemas.RuleResponse:
     return schemas.RuleResponse(
@@ -74,16 +113,59 @@ def _serialize_rule(rule: models.Rule) -> schemas.RuleResponse:
         requires_ack=rule.requires_ack,
         ack_deadline=rule.ack_deadline,
         fallback_policy_json=rule.fallback_policy_json,
+        dedupe_window_seconds=rule.dedupe_window_seconds,
+        dedupe_fields_json=rule.dedupe_fields_json,
+        notification_templates_json=rule.notification_templates_json,
+        runbook_url=rule.runbook_url,
+        channel_retry_policy_json=rule.channel_retry_policy_json,
     )
 
-def _simulate_rule(rule: models.Rule, payload: dict[str, object]) -> schemas.RuleSimulationResponse:
+
+def _extract_dedupe_value(event_dict: dict[str, object], path: str) -> str:
+    current: object = event_dict
+    for part in [segment for segment in str(path).split(".") if segment]:
+        if isinstance(current, dict):
+            current = current.get(part)
+        else:
+            current = None
+        if current is None:
+            break
+    if current is None:
+        return ""
+    if isinstance(current, (dict, list)):
+        return json.dumps(current, sort_keys=True, ensure_ascii=True)
+    return str(current)
+
+
+def _build_rule_dedupe_key(
+    event_dict: dict[str, object],
+    matched_rule: models.Rule | None,
+) -> str | None:
+    if not matched_rule:
+        return None
+    fields = matched_rule.dedupe_fields_json or []
+    if not isinstance(fields, list) or not fields:
+        return None
+
+    window = max(1, int(matched_rule.dedupe_window_seconds or 300))
+    bucket = int(time.time()) // window
+    basis = "|".join(
+        [f"{field}={_extract_dedupe_value(event_dict, str(field))}" for field in fields]
+    )
+    digest = hashlib.sha256(
+        f"{matched_rule.id}|{bucket}|{basis}".encode("utf-8")
+    ).hexdigest()
+    return f"rule:{matched_rule.id}:{digest}"
+
+
+def _simulate_rule(
+    rule: models.Rule, payload: dict[str, object]
+) -> schemas.RuleSimulationResponse:
     reasons: list[str] = []
     for key, expected_value in rule.condition_json.items():
         actual_value = payload.get(key, None)
         if actual_value != expected_value:
-            reasons.append(
-                f"{key}: expected {expected_value!r}, got {actual_value!r}"
-            )
+            reasons.append(f"{key}: expected {expected_value!r}, got {actual_value!r}")
 
     matched = len(reasons) == 0
     return schemas.RuleSimulationResponse(
@@ -94,6 +176,7 @@ def _simulate_rule(rule: models.Rule, payload: dict[str, object]) -> schemas.Rul
         payload=payload,
         condition_json=rule.condition_json,
     )
+
 
 def _get_or_create_trace_id(db: Session, incident_id: uuid.UUID) -> str:
     first_log = (
@@ -106,8 +189,10 @@ def _get_or_create_trace_id(db: Session, incident_id: uuid.UUID) -> str:
         return first_log.trace_id
     return str(uuid.uuid4())
 
+
 def _queue_length(queue_key: str) -> int:
     return int(redis_conn.llen(queue_key) or 0)
+
 
 def _metric_value_from_redis(value):
     if isinstance(value, bytes):
@@ -119,19 +204,25 @@ def _metric_value_from_redis(value):
             return value
     return value
 
-def _dependency_status(ok: bool, detail: str | None = None) -> schemas.DependencyStatusDetail:
+
+def _dependency_status(
+    ok: bool, detail: str | None = None
+) -> schemas.DependencyStatusDetail:
     return schemas.DependencyStatusDetail(
         status="ok" if ok else "down",
         detail=detail,
     )
 
+
 def _severity_rank(severity: str) -> int:
     return {"ok": 0, "info": 1, "warn": 2, "critical": 3}.get(severity, 0)
+
 
 def _overall_severity(alerts: list[schemas.OperationalAlert]) -> str:
     if not alerts:
         return "ok"
     return max(alerts, key=lambda alert: _severity_rank(alert.severity)).severity
+
 
 def _require_admin_token(x_admin_token: str | None) -> None:
     configured_token = os.environ.get("SERIEMA_ADMIN_TOKEN")
@@ -139,6 +230,7 @@ def _require_admin_token(x_admin_token: str | None) -> None:
         return
     if not x_admin_token or not hmac.compare_digest(x_admin_token, configured_token):
         raise HTTPException(status_code=401, detail="Invalid admin token")
+
 
 def _parse_dlq_entry(raw_entry: bytes | str) -> dict:
     if isinstance(raw_entry, bytes):
@@ -152,9 +244,12 @@ def _parse_dlq_entry(raw_entry: bytes | str) -> dict:
             "raw": raw_entry,
         }
 
+
 def _dlq_items(limit: int) -> tuple[int, list[schemas.DLQPreviewItem]]:
     total_items = int(redis_conn.llen(prefixed_redis_key(DLQ_QUEUE_NAME)) or 0)
-    raw_entries = redis_conn.lrange(prefixed_redis_key(DLQ_QUEUE_NAME), 0, max(limit, 0) - 1)
+    raw_entries = redis_conn.lrange(
+        prefixed_redis_key(DLQ_QUEUE_NAME), 0, max(limit, 0) - 1
+    )
     items: list[schemas.DLQPreviewItem] = []
     for raw_entry in raw_entries:
         payload = _parse_dlq_entry(raw_entry)
@@ -169,8 +264,9 @@ def _dlq_items(limit: int) -> tuple[int, list[schemas.DLQPreviewItem]]:
                 kwargs=dict(payload.get("kwargs") or {}),
                 failed_at=payload.get("failed_at"),
             )
-            )
+        )
     return total_items, items
+
 
 def _validate_ops_limit(limit: int) -> None:
     if limit > OPS_ENDPOINT_MAX_LIMIT:
@@ -178,6 +274,7 @@ def _validate_ops_limit(limit: int) -> None:
             status_code=400,
             detail=f"limit exceeds maximum of {OPS_ENDPOINT_MAX_LIMIT}",
         )
+
 
 def _calculate_sla_metrics(db: Session, hours: int = 24) -> schemas.SLAMetricsResponse:
     window_end = datetime.now(timezone.utc)
@@ -244,9 +341,12 @@ def _calculate_sla_metrics(db: Session, hours: int = 24) -> schemas.SLAMetricsRe
         total_incidents=total_incidents,
         acknowledged_incidents=acknowledged_incidents,
         acknowledgement_rate=acknowledgement_rate,
-        average_tta_seconds=float(average_tta_seconds) if average_tta_seconds is not None else None,
+        average_tta_seconds=(
+            float(average_tta_seconds) if average_tta_seconds is not None else None
+        ),
         incidents_by_status=incidents_by_status,
     )
+
 
 def _build_operational_alerts(
     db: Session,
@@ -327,6 +427,7 @@ def _build_operational_alerts(
 
     return alerts
 
+
 def _verify_voice_webhook_signature(
     body: bytes,
     timestamp_header: str | None,
@@ -363,9 +464,56 @@ def _verify_voice_webhook_signature(
 
     return True, "ok"
 
+
+def _fetch_oasis_radar_entries(
+    query: str,
+    lookback_seconds: int,
+    limit: int,
+) -> list[dict]:
+    if not OASIS_RADAR_ENABLED:
+        return []
+
+    end_ns = int(time.time() * 1_000_000_000)
+    start_ns = end_ns - max(1, lookback_seconds) * 1_000_000_000
+    encoded_query = urlencode(
+        {
+            "query": query,
+            "start": str(start_ns),
+            "end": str(end_ns),
+            "limit": str(max(1, limit)),
+            "direction": "forward",
+        }
+    )
+    endpoint = (
+        f"{OASIS_RADAR_LOKI_URL.rstrip('/')}/loki/api/v1/query_range?{encoded_query}"
+    )
+    request = UrlRequest(endpoint, method="GET")
+
+    with urlopen(request, timeout=15) as response:
+        raw = response.read().decode("utf-8")
+    parsed = json.loads(raw)
+    result = parsed.get("data", {}).get("result", [])
+
+    entries: list[dict] = []
+    for stream in result:
+        labels = stream.get("stream", {})
+        for value in stream.get("values", []):
+            if not isinstance(value, list) or len(value) < 2:
+                continue
+            entries.append(
+                {
+                    "timestamp_ns": value[0],
+                    "line": value[1],
+                    "labels": labels,
+                }
+            )
+    return entries
+
+
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
 
 @app.get("/health/deps", response_model=schemas.HealthDepsResponse)
 def health_dependencies(db: Session = Depends(get_db)):
@@ -391,32 +539,110 @@ def health_dependencies(db: Session = Depends(get_db)):
         overall="ok" if overall_ok else "down",
     )
 
+
+@app.get("/health/integrations", response_model=schemas.HealthIntegrationsResponse)
+def health_integrations():
+    integrations: list[schemas.IntegrationStatusDetail] = []
+
+    voice_provider = (VOICE_PROVIDER or "mock").strip().lower()
+    if voice_provider == "twilio":
+        configured = all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER])
+        integrations.append(
+            schemas.IntegrationStatusDetail(
+                name="voice:twilio",
+                status="ok" if configured else "down",
+                detail=None if configured else "Missing Twilio credentials",
+            )
+        )
+    elif voice_provider == "signalwire":
+        configured = all(
+            [
+                SIGNALWIRE_SPACE_URL,
+                SIGNALWIRE_PROJECT_ID,
+                SIGNALWIRE_API_TOKEN,
+                SIGNALWIRE_FROM_NUMBER,
+            ]
+        )
+        integrations.append(
+            schemas.IntegrationStatusDetail(
+                name="voice:signalwire",
+                status="ok" if configured else "down",
+                detail=None if configured else "Missing SignalWire credentials",
+            )
+        )
+    else:
+        integrations.append(
+            schemas.IntegrationStatusDetail(
+                name="voice",
+                status="disabled",
+                detail=f"provider={voice_provider}",
+            )
+        )
+
+    integrations.append(
+        schemas.IntegrationStatusDetail(
+            name="sentry",
+            status="ok" if bool(SENTRY_DSN) else "disabled",
+            detail=None if SENTRY_DSN else "SENTRY_DSN not configured",
+        )
+    )
+    integrations.append(
+        schemas.IntegrationStatusDetail(
+            name="langfuse",
+            status=(
+                "ok"
+                if bool(LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY)
+                else "disabled"
+            ),
+            detail=(
+                None
+                if (LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY)
+                else "Langfuse keys not configured"
+            ),
+        )
+    )
+    integrations.append(
+        schemas.IntegrationStatusDetail(
+            name="prometheus",
+            status="ok" if SERIEMA_PROMETHEUS_ENABLED else "disabled",
+            detail=(
+                "/metrics exposed"
+                if SERIEMA_PROMETHEUS_ENABLED
+                else "SERIEMA_PROMETHEUS_ENABLED=false"
+            ),
+        )
+    )
+    integrations.append(
+        schemas.IntegrationStatusDetail(
+            name="oasis-radar",
+            status="ok" if OASIS_RADAR_ENABLED else "disabled",
+            detail=(
+                OASIS_RADAR_LOKI_URL
+                if OASIS_RADAR_ENABLED
+                else "OASIS_RADAR_ENABLED=false"
+            ),
+        )
+    )
+
+    statuses = {item.status for item in integrations}
+    overall: str
+    if "down" in statuses:
+        overall = "down"
+    elif "disabled" in statuses:
+        overall = "degraded"
+    else:
+        overall = "ok"
+
+    return schemas.HealthIntegrationsResponse(
+        overall=overall,
+        integrations=integrations,
+    )
+
+
 @app.post("/events/incoming", response_model=schemas.EventIngestResponse)
 def ingest_event(event: schemas.EventIncoming, db: Session = Depends(get_db)):
     audit_trace_id = str(uuid.uuid4())
 
-    if event.dedupe_key and is_duplicate(f"dedupe:{event.dedupe_key}"):
-        db.add(
-            models.AuditLog(
-                trace_id=audit_trace_id,
-                incident_id=None,
-                action=models.AuditAction.DUPLICATED_EVENT,
-                details_json={
-                    "source": event.source,
-                    "external_event_id": event.external_event_id,
-                    "dedupe_key": event.dedupe_key,
-                },
-            )
-        )
-        db.commit()
-        return schemas.EventIngestResponse(
-            status="ignored",
-            reason="duplicate",
-            incident_id=None,
-            matched_rule=False,
-            trace_id=audit_trace_id,
-        )
-            
     event_dict = event.dict()
     active_rules = (
         db.query(models.Rule)
@@ -425,7 +651,41 @@ def ingest_event(event: schemas.EventIncoming, db: Session = Depends(get_db)):
         .all()
     )
     matched_rule = evaluate_rules(event_dict, active_rules)
-    
+    effective_dedupe_key = event.dedupe_key or _build_rule_dedupe_key(
+        event_dict, matched_rule
+    )
+    if effective_dedupe_key and is_duplicate(f"dedupe:{effective_dedupe_key}"):
+        db.add(
+            models.AuditLog(
+                trace_id=audit_trace_id,
+                incident_id=None,
+                action=models.AuditAction.DUPLICATED_EVENT,
+                details_json={
+                    "source": event.source,
+                    "external_event_id": event.external_event_id,
+                    "dedupe_key": effective_dedupe_key,
+                },
+            )
+        )
+        db.commit()
+        notify_event(
+            "seriema.event.duplicate",
+            {
+                "trace_id": audit_trace_id,
+                "source": event.source,
+                "external_event_id": event.external_event_id,
+                "dedupe_key": effective_dedupe_key,
+            },
+            trace_id=audit_trace_id,
+        )
+        return schemas.EventIngestResponse(
+            status="ignored",
+            reason="duplicate",
+            incident_id=None,
+            matched_rule=False,
+            trace_id=audit_trace_id,
+        )
+
     incident = models.Incident(
         external_event_id=event.external_event_id,
         source=event.source,
@@ -435,13 +695,31 @@ def ingest_event(event: schemas.EventIncoming, db: Session = Depends(get_db)):
         payload_json=event.payload_json,
         status=models.IncidentStatus.OPEN,
         matched_rule_id=matched_rule.id if matched_rule else None,
-        dedupe_key=event.dedupe_key
+        dedupe_key=effective_dedupe_key,
     )
     db.add(incident)
     try:
         db.commit()
     except IntegrityError:
         db.rollback()
+        notify_exception(
+            RuntimeError("duplicate_source_external_event_id"),
+            {
+                "trace_id": audit_trace_id,
+                "source": event.source,
+                "external_event_id": event.external_event_id,
+            },
+            trace_id=audit_trace_id,
+        )
+        notify_event(
+            "seriema.event.duplicate_source_external_event_id",
+            {
+                "trace_id": audit_trace_id,
+                "source": event.source,
+                "external_event_id": event.external_event_id,
+            },
+            trace_id=audit_trace_id,
+        )
         return schemas.EventIngestResponse(
             status="ignored",
             reason="duplicate_source_external_event_id",
@@ -450,12 +728,12 @@ def ingest_event(event: schemas.EventIncoming, db: Session = Depends(get_db)):
             trace_id=audit_trace_id,
         )
     db.refresh(incident)
-    
+
     audit = models.AuditLog(
         trace_id=audit_trace_id,
         incident_id=incident.id,
         action=models.AuditAction.EVENT_RECEIVED,
-        details_json={"payload": event_dict}
+        details_json={"payload": event_dict},
     )
     db.add(audit)
     if matched_rule:
@@ -468,19 +746,100 @@ def ingest_event(event: schemas.EventIncoming, db: Session = Depends(get_db)):
             )
         )
     db.commit()
-    
+
     if matched_rule:
         dispatch_incident.apply_async(
             args=(str(incident.id), audit_trace_id),
             queue=queue_name("dispatch"),
         )
-        
+    notify_event(
+        "seriema.event.accepted",
+        {
+            "trace_id": audit_trace_id,
+            "incident_id": str(incident.id),
+            "matched_rule": bool(matched_rule),
+            "source": incident.source,
+            "severity": incident.severity,
+        },
+        trace_id=audit_trace_id,
+    )
+
     return schemas.EventIngestResponse(
         status="accepted",
         incident_id=incident.id,
         matched_rule=bool(matched_rule),
         trace_id=audit_trace_id,
     )
+
+
+@app.post("/integrations/oasis-radar/pull")
+def pull_oasis_radar(
+    lookback_seconds: int = Query(default=OASIS_RADAR_LOOKBACK_SECONDS, ge=10, le=3600),
+    limit: int = Query(default=OASIS_RADAR_PULL_LIMIT, ge=1, le=500),
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    db: Session = Depends(get_db),
+):
+    _require_admin_token(x_admin_token)
+    _validate_ops_limit(limit)
+
+    entries = _fetch_oasis_radar_entries(
+        query=OASIS_RADAR_LOGQL_QUERY,
+        lookback_seconds=lookback_seconds,
+        limit=limit,
+    )
+    if not entries:
+        return {"status": "ok", "fetched": 0, "accepted": 0, "duplicates": 0}
+
+    accepted = 0
+    duplicates = 0
+    for entry in entries:
+        labels = entry.get("labels", {})
+        line = str(entry.get("line", "")).strip()
+        timestamp_ns = str(entry.get("timestamp_ns", ""))
+        service = (
+            labels.get("compose_service") or labels.get("container") or "oasis-radar"
+        )
+        dedupe_key = hashlib.sha256(
+            f"{timestamp_ns}:{service}:{line}".encode("utf-8")
+        ).hexdigest()
+
+        if is_duplicate(f"oasis-radar:{dedupe_key}"):
+            duplicates += 1
+            continue
+
+        severity = (
+            "CRITICAL"
+            if re.search(r"(error|fatal|critical|panic)", line, re.IGNORECASE)
+            else "WARN"
+        )
+        event = schemas.EventIncoming(
+            external_event_id=f"oasis-radar-{timestamp_ns}-{service}",
+            source=f"oasis-radar:{service}",
+            severity=severity,
+            title=f"Oasis Radar signal from {service}",
+            message=line[:5000],
+            payload_json={"labels": labels, "timestamp_ns": timestamp_ns},
+            dedupe_key=dedupe_key,
+        )
+        ingest_event(event=event, db=db)
+        accepted += 1
+
+    notify_event(
+        "seriema.oasis_radar.pull",
+        {
+            "fetched": len(entries),
+            "accepted": accepted,
+            "duplicates": duplicates,
+            "lookback_seconds": lookback_seconds,
+        },
+    )
+    return {
+        "status": "ok",
+        "fetched": len(entries),
+        "accepted": accepted,
+        "duplicates": duplicates,
+    }
+
 
 @app.post("/rules", response_model=schemas.RuleResponse)
 def create_rule(rule: schemas.RuleCreate, db: Session = Depends(get_db)):
@@ -491,6 +850,7 @@ def create_rule(rule: schemas.RuleCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(db_rule)
     return _serialize_rule(db_rule)
+
 
 @app.get("/rules", response_model=schemas.RuleListResponse)
 def list_rules(
@@ -508,7 +868,9 @@ def list_rules(
     if recipient_group_id is not None:
         query = query.filter(models.Rule.recipient_group_id == recipient_group_id)
 
-    rules = query.order_by(models.Rule.priority.asc(), models.Rule.rule_name.asc(), models.Rule.id.asc()).all()
+    rules = query.order_by(
+        models.Rule.priority.asc(), models.Rule.rule_name.asc(), models.Rule.id.asc()
+    ).all()
     total = len(rules)
     items = rules[offset : offset + limit]
 
@@ -518,6 +880,7 @@ def list_rules(
         offset=offset,
         items=[_serialize_rule(rule) for rule in items],
     )
+
 
 @app.patch("/rules/{rule_id}", response_model=schemas.RuleResponse)
 def update_rule(
@@ -544,6 +907,11 @@ def update_rule(
         "requires_ack": rule_update.requires_ack,
         "ack_deadline": rule_update.ack_deadline,
         "fallback_policy_json": rule_update.fallback_policy_json,
+        "dedupe_window_seconds": rule_update.dedupe_window_seconds,
+        "dedupe_fields_json": rule_update.dedupe_fields_json,
+        "notification_templates_json": rule_update.notification_templates_json,
+        "runbook_url": rule_update.runbook_url,
+        "channel_retry_policy_json": rule_update.channel_retry_policy_json,
     }
     provided = {key: value for key, value in update_data.items() if value is not None}
     if not provided:
@@ -565,6 +933,7 @@ def update_rule(
     db.refresh(db_rule)
     return _serialize_rule(db_rule)
 
+
 @app.post("/rules/{rule_id}/toggle", response_model=schemas.RuleResponse)
 def toggle_rule(rule_id: str, db: Session = Depends(get_db)):
     try:
@@ -580,6 +949,7 @@ def toggle_rule(rule_id: str, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(db_rule)
     return _serialize_rule(db_rule)
+
 
 @app.post("/rules/{rule_id}/simulate", response_model=schemas.RuleSimulationResponse)
 def simulate_rule(
@@ -598,7 +968,10 @@ def simulate_rule(
 
     return _simulate_rule(db_rule, payload)
 
-def _load_contact_or_404(contact_id: str, db: Session) -> tuple[uuid.UUID, models.Contact]:
+
+def _load_contact_or_404(
+    contact_id: str, db: Session
+) -> tuple[uuid.UUID, models.Contact]:
     try:
         contact_uuid = uuid.UUID(contact_id)
     except ValueError as exc:
@@ -608,6 +981,7 @@ def _load_contact_or_404(contact_id: str, db: Session) -> tuple[uuid.UUID, model
     if not contact:
         raise HTTPException(status_code=404, detail="Contact not found")
     return contact_uuid, contact
+
 
 def _load_group_or_404(group_id: str, db: Session) -> tuple[uuid.UUID, models.Group]:
     try:
@@ -620,11 +994,13 @@ def _load_group_or_404(group_id: str, db: Session) -> tuple[uuid.UUID, models.Gr
         raise HTTPException(status_code=404, detail="Group not found")
     return group_uuid, group
 
+
 def _has_any_rows(query) -> bool:
     try:
         return query.first() is not None
     except Exception:
         return False
+
 
 def _serialize_contact(contact: models.Contact) -> schemas.ContactResponse:
     return schemas.ContactResponse(
@@ -636,6 +1012,7 @@ def _serialize_contact(contact: models.Contact) -> schemas.ContactResponse:
         telegram_id=contact.telegram_id,
     )
 
+
 def _serialize_group(group: models.Group) -> schemas.GroupResponse:
     return schemas.GroupResponse(
         id=group.id,
@@ -643,17 +1020,32 @@ def _serialize_group(group: models.Group) -> schemas.GroupResponse:
         description=group.description,
     )
 
+
 def _delete_contact_guard(db: Session, contact_uuid: uuid.UUID) -> None:
-    if _has_any_rows(db.query(models.Notification).filter(models.Notification.contact_id == contact_uuid)):
+    if _has_any_rows(
+        db.query(models.Notification).filter(
+            models.Notification.contact_id == contact_uuid
+        )
+    ):
         raise HTTPException(status_code=409, detail="Contact has related notifications")
-    if _has_any_rows(db.query(models.GroupMember).filter(models.GroupMember.contact_id == contact_uuid)):
+    if _has_any_rows(
+        db.query(models.GroupMember).filter(
+            models.GroupMember.contact_id == contact_uuid
+        )
+    ):
         raise HTTPException(status_code=409, detail="Contact has related group members")
 
+
 def _delete_group_guard(db: Session, group_uuid: uuid.UUID) -> None:
-    if _has_any_rows(db.query(models.Rule).filter(models.Rule.recipient_group_id == group_uuid)):
+    if _has_any_rows(
+        db.query(models.Rule).filter(models.Rule.recipient_group_id == group_uuid)
+    ):
         raise HTTPException(status_code=409, detail="Group has related rules")
-    if _has_any_rows(db.query(models.GroupMember).filter(models.GroupMember.group_id == group_uuid)):
+    if _has_any_rows(
+        db.query(models.GroupMember).filter(models.GroupMember.group_id == group_uuid)
+    ):
         raise HTTPException(status_code=409, detail="Group has related members")
+
 
 @app.post("/groups", response_model=schemas.GroupResponse)
 def create_group(group: schemas.GroupCreate, db: Session = Depends(get_db)):
@@ -665,6 +1057,7 @@ def create_group(group: schemas.GroupCreate, db: Session = Depends(get_db)):
     db.refresh(db_group)
     return _serialize_group(db_group)
 
+
 @app.post("/contacts", response_model=schemas.ContactResponse)
 def create_contact(contact: schemas.ContactCreate, db: Session = Depends(get_db)):
     db_contact = models.Contact(**contact.model_dump())
@@ -675,6 +1068,7 @@ def create_contact(contact: schemas.ContactCreate, db: Session = Depends(get_db)
     db.refresh(db_contact)
     return _serialize_contact(db_contact)
 
+
 @app.get("/contacts", response_model=schemas.ContactListResponse)
 def list_contacts(
     limit: int = Query(20, ge=1),
@@ -682,18 +1076,26 @@ def list_contacts(
     db: Session = Depends(get_db),
 ):
     _validate_ops_limit(limit)
-    contacts = db.query(models.Contact).order_by(models.Contact.name.asc(), models.Contact.id.asc()).all()
+    contacts = (
+        db.query(models.Contact)
+        .order_by(models.Contact.name.asc(), models.Contact.id.asc())
+        .all()
+    )
     return schemas.ContactListResponse(
         total=len(contacts),
         limit=limit,
         offset=offset,
-        items=[_serialize_contact(contact) for contact in contacts[offset : offset + limit]],
+        items=[
+            _serialize_contact(contact) for contact in contacts[offset : offset + limit]
+        ],
     )
+
 
 @app.get("/contacts/{contact_id}", response_model=schemas.ContactResponse)
 def get_contact(contact_id: str, db: Session = Depends(get_db)):
     _, contact = _load_contact_or_404(contact_id, db)
     return _serialize_contact(contact)
+
 
 @app.patch("/contacts/{contact_id}", response_model=schemas.ContactResponse)
 def update_contact(
@@ -702,7 +1104,11 @@ def update_contact(
     db: Session = Depends(get_db),
 ):
     _, contact = _load_contact_or_404(contact_id, db)
-    update_data = {key: value for key, value in contact_update.model_dump().items() if value is not None}
+    update_data = {
+        key: value
+        for key, value in contact_update.model_dump().items()
+        if value is not None
+    }
     if not update_data:
         raise HTTPException(status_code=400, detail="No contact fields provided")
     for key, value in update_data.items():
@@ -710,6 +1116,7 @@ def update_contact(
     db.commit()
     db.refresh(contact)
     return _serialize_contact(contact)
+
 
 @app.delete("/contacts/{contact_id}", status_code=204)
 def delete_contact(contact_id: str, db: Session = Depends(get_db)):
@@ -719,6 +1126,7 @@ def delete_contact(contact_id: str, db: Session = Depends(get_db)):
     db.commit()
     return Response(status_code=204)
 
+
 @app.get("/groups", response_model=schemas.GroupListResponse)
 def list_groups(
     limit: int = Query(20, ge=1),
@@ -726,7 +1134,11 @@ def list_groups(
     db: Session = Depends(get_db),
 ):
     _validate_ops_limit(limit)
-    groups = db.query(models.Group).order_by(models.Group.name.asc(), models.Group.id.asc()).all()
+    groups = (
+        db.query(models.Group)
+        .order_by(models.Group.name.asc(), models.Group.id.asc())
+        .all()
+    )
     return schemas.GroupListResponse(
         total=len(groups),
         limit=limit,
@@ -734,10 +1146,12 @@ def list_groups(
         items=[_serialize_group(group) for group in groups[offset : offset + limit]],
     )
 
+
 @app.get("/groups/{group_id}", response_model=schemas.GroupResponse)
 def get_group(group_id: str, db: Session = Depends(get_db)):
     _, group = _load_group_or_404(group_id, db)
     return _serialize_group(group)
+
 
 @app.patch("/groups/{group_id}", response_model=schemas.GroupResponse)
 def update_group(
@@ -746,7 +1160,11 @@ def update_group(
     db: Session = Depends(get_db),
 ):
     _, group = _load_group_or_404(group_id, db)
-    update_data = {key: value for key, value in group_update.model_dump().items() if value is not None}
+    update_data = {
+        key: value
+        for key, value in group_update.model_dump().items()
+        if value is not None
+    }
     if not update_data:
         raise HTTPException(status_code=400, detail="No group fields provided")
     for key, value in update_data.items():
@@ -754,6 +1172,7 @@ def update_group(
     db.commit()
     db.refresh(group)
     return _serialize_group(group)
+
 
 @app.delete("/groups/{group_id}", status_code=204)
 def delete_group(group_id: str, db: Session = Depends(get_db)):
@@ -763,8 +1182,11 @@ def delete_group(group_id: str, db: Session = Depends(get_db)):
     db.commit()
     return Response(status_code=204)
 
+
 @app.post("/groups/{group_id}/members", response_model=schemas.GroupMemberResponse)
-def add_group_member(group_id: str, member: schemas.GroupMemberCreate, db: Session = Depends(get_db)):
+def add_group_member(
+    group_id: str, member: schemas.GroupMemberCreate, db: Session = Depends(get_db)
+):
     try:
         group_uuid = uuid.UUID(group_id)
     except ValueError as exc:
@@ -774,7 +1196,9 @@ def add_group_member(group_id: str, member: schemas.GroupMemberCreate, db: Sessi
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
 
-    contact = db.query(models.Contact).filter(models.Contact.id == member.contact_id).first()
+    contact = (
+        db.query(models.Contact).filter(models.Contact.id == member.contact_id).first()
+    )
     if not contact:
         raise HTTPException(status_code=404, detail="Contact not found")
 
@@ -787,11 +1211,16 @@ def add_group_member(group_id: str, member: schemas.GroupMemberCreate, db: Sessi
         .first()
     )
     if not existing:
-        db_member = models.GroupMember(group_id=group_uuid, contact_id=member.contact_id)
+        db_member = models.GroupMember(
+            group_id=group_uuid, contact_id=member.contact_id
+        )
         db.add(db_member)
         db.commit()
 
-    return schemas.GroupMemberResponse(group_id=group_uuid, contact_id=member.contact_id)
+    return schemas.GroupMemberResponse(
+        group_id=group_uuid, contact_id=member.contact_id
+    )
+
 
 @app.delete("/groups/{group_id}/members/{contact_id}", status_code=204)
 def delete_group_member(group_id: str, contact_id: str, db: Session = Depends(get_db)):
@@ -820,6 +1249,7 @@ def delete_group_member(group_id: str, contact_id: str, db: Session = Depends(ge
     db.commit()
     return Response(status_code=204)
 
+
 @app.get("/groups/{group_id}/members", response_model=list[schemas.GroupMemberResponse])
 def list_group_members(group_id: str, db: Session = Depends(get_db)):
     try:
@@ -831,11 +1261,18 @@ def list_group_members(group_id: str, db: Session = Depends(get_db)):
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
 
-    members = db.query(models.GroupMember).filter(models.GroupMember.group_id == group_uuid).all()
+    members = (
+        db.query(models.GroupMember)
+        .filter(models.GroupMember.group_id == group_uuid)
+        .all()
+    )
     return [
-        schemas.GroupMemberResponse(group_id=member.group_id, contact_id=member.contact_id)
+        schemas.GroupMemberResponse(
+            group_id=member.group_id, contact_id=member.contact_id
+        )
         for member in members
     ]
+
 
 @app.get("/incidents/{incident_id}", response_model=schemas.IncidentDetailsResponse)
 def get_incident(incident_id: str, db: Session = Depends(get_db)):
@@ -844,23 +1281,28 @@ def get_incident(incident_id: str, db: Session = Depends(get_db)):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Invalid incident id") from exc
 
-    incident = db.query(models.Incident).filter(models.Incident.id == incident_uuid).first()
+    incident = (
+        db.query(models.Incident).filter(models.Incident.id == incident_uuid).first()
+    )
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
-        
+
     audit_logs = (
         db.query(models.AuditLog)
         .filter(models.AuditLog.incident_id == incident_uuid)
         .order_by(models.AuditLog.created_at)
         .all()
     )
-    
+
     return schemas.IncidentDetailsResponse(
         incident=_serialize_incident(incident),
         logs=[_serialize_audit(log) for log in audit_logs],
     )
 
-@app.get("/incidents/{incident_id}/timeline", response_model=schemas.IncidentTimelineResponse)
+
+@app.get(
+    "/incidents/{incident_id}/timeline", response_model=schemas.IncidentTimelineResponse
+)
 def get_incident_timeline(
     incident_id: str,
     action: models.AuditAction | None = Query(default=None),
@@ -873,13 +1315,17 @@ def get_incident_timeline(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Invalid incident id") from exc
 
-    incident = db.query(models.Incident).filter(models.Incident.id == incident_uuid).first()
+    incident = (
+        db.query(models.Incident).filter(models.Incident.id == incident_uuid).first()
+    )
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
 
     _validate_ops_limit(limit)
 
-    query = db.query(models.AuditLog).filter(models.AuditLog.incident_id == incident_uuid)
+    query = db.query(models.AuditLog).filter(
+        models.AuditLog.incident_id == incident_uuid
+    )
     if action is not None:
         query = query.filter(models.AuditLog.action == action)
 
@@ -898,7 +1344,10 @@ def get_incident_timeline(
         items=[_serialize_audit(log) for log in timeline_items],
     )
 
-@app.post("/incidents/{incident_id}/ack", response_model=schemas.IncidentLifecycleResponse)
+
+@app.post(
+    "/incidents/{incident_id}/ack", response_model=schemas.IncidentLifecycleResponse
+)
 def acknowledge_incident(
     incident_id: str,
     payload: schemas.AckIncidentRequest,
@@ -909,7 +1358,9 @@ def acknowledge_incident(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Invalid incident id") from exc
 
-    incident = db.query(models.Incident).filter(models.Incident.id == incident_uuid).first()
+    incident = (
+        db.query(models.Incident).filter(models.Incident.id == incident_uuid).first()
+    )
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
 
@@ -937,13 +1388,25 @@ def acknowledge_incident(
         )
     )
     db.commit()
+    notify_event(
+        "seriema.incident.acknowledged",
+        {
+            "incident_id": str(incident.id),
+            "acknowledged_by": incident.acknowledged_by,
+            "source": "api",
+        },
+        trace_id=trace_id,
+    )
 
     return schemas.IncidentLifecycleResponse(
         action="ack",
         incident=_serialize_incident(incident),
     )
 
-@app.post("/incidents/{incident_id}/resolve", response_model=schemas.IncidentLifecycleResponse)
+
+@app.post(
+    "/incidents/{incident_id}/resolve", response_model=schemas.IncidentLifecycleResponse
+)
 def resolve_incident(
     incident_id: str,
     payload: schemas.ResolveIncidentRequest,
@@ -954,12 +1417,19 @@ def resolve_incident(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Invalid incident id") from exc
 
-    incident = db.query(models.Incident).filter(models.Incident.id == incident_uuid).first()
+    incident = (
+        db.query(models.Incident).filter(models.Incident.id == incident_uuid).first()
+    )
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
 
-    if incident.status not in {models.IncidentStatus.ACKNOWLEDGED, models.IncidentStatus.ESCALATED}:
-        raise HTTPException(status_code=409, detail="Incident cannot be resolved from current status")
+    if incident.status not in {
+        models.IncidentStatus.ACKNOWLEDGED,
+        models.IncidentStatus.ESCALATED,
+    }:
+        raise HTTPException(
+            status_code=409, detail="Incident cannot be resolved from current status"
+        )
 
     resolved_at = datetime.now(timezone.utc)
     incident.status = models.IncidentStatus.RESOLVED
@@ -980,11 +1450,21 @@ def resolve_incident(
         )
     )
     db.commit()
+    notify_event(
+        "seriema.incident.resolved",
+        {
+            "incident_id": str(incident.id),
+            "resolved_by": payload.resolved_by,
+            "source": "api",
+        },
+        trace_id=trace_id,
+    )
 
     return schemas.IncidentLifecycleResponse(
         action="resolve",
         incident=_serialize_incident(incident),
     )
+
 
 @app.get("/incidents", response_model=schemas.IncidentListResponse)
 def list_incidents(
@@ -1023,12 +1503,14 @@ def list_incidents(
         items=[_serialize_incident(incident) for incident in incidents],
     )
 
+
 @app.get("/metrics/sla", response_model=schemas.SLAMetricsResponse)
 def get_sla_metrics(
     hours: int = Query(24, ge=1, le=720),
     db: Session = Depends(get_db),
 ):
     return _calculate_sla_metrics(db, hours=hours)
+
 
 @app.get("/metrics/queues", response_model=schemas.QueueMetricsResponse)
 def get_queue_metrics():
@@ -1041,11 +1523,14 @@ def get_queue_metrics():
         dlq=_queue_length(prefixed_redis_key(DLQ_QUEUE_NAME)),
     )
 
+
 @app.get("/metrics/ops", response_model=schemas.OpsMetricsResponse)
 def get_ops_metrics():
     raw_metrics = redis_conn.hgetall(prefixed_redis_key(METRICS_KEY))
     parsed_metrics = {
-        str(key.decode("utf-8") if isinstance(key, bytes) else key): _metric_value_from_redis(value)
+        str(
+            key.decode("utf-8") if isinstance(key, bytes) else key
+        ): _metric_value_from_redis(value)
         for key, value in raw_metrics.items()
     }
     return schemas.OpsMetricsResponse(
@@ -1053,11 +1538,14 @@ def get_ops_metrics():
         metrics=parsed_metrics,
     )
 
+
 @app.get("/alerts/ops", response_model=schemas.OpsAlertsResponse)
 def get_ops_alerts(db: Session = Depends(get_db)):
     raw_metrics = redis_conn.hgetall(prefixed_redis_key(METRICS_KEY))
     parsed_metrics = {
-        str(key.decode("utf-8") if isinstance(key, bytes) else key): _metric_value_from_redis(value)
+        str(
+            key.decode("utf-8") if isinstance(key, bytes) else key
+        ): _metric_value_from_redis(value)
         for key, value in raw_metrics.items()
     }
     queue_metrics = schemas.QueueMetricsResponse(
@@ -1077,6 +1565,7 @@ def get_ops_alerts(db: Session = Depends(get_db)):
         queue_metrics=queue_metrics,
     )
 
+
 @app.get("/ops/dlq/preview", response_model=schemas.DLQPreviewResponse)
 def preview_dlq(
     limit: int = Query(20, ge=1),
@@ -1086,6 +1575,7 @@ def preview_dlq(
     _validate_ops_limit(limit)
     total_items, items = _dlq_items(limit)
     return schemas.DLQPreviewResponse(limit=limit, total_items=total_items, items=items)
+
 
 @app.post("/ops/dlq/replay", response_model=schemas.DLQReplayResponse)
 def replay_dlq_operations(
@@ -1110,6 +1600,7 @@ def replay_dlq_operations(
         result=None,
     )
 
+
 def _coerce_optional_int(value):
     if value is None or value == "":
         return None
@@ -1117,6 +1608,7 @@ def _coerce_optional_int(value):
         return int(value)
     except (TypeError, ValueError):
         return None
+
 
 def _coerce_optional_bool(value) -> bool:
     if isinstance(value, bool):
@@ -1133,6 +1625,7 @@ def _coerce_optional_bool(value) -> bool:
         return bool(int(value))
     except (TypeError, ValueError):
         return bool(value)
+
 
 @app.get("/ops/dlq/replay/last", response_model=schemas.DLQReplayReportResponse)
 def get_last_dlq_replay_report():
@@ -1153,12 +1646,19 @@ def get_last_dlq_replay_report():
             normalized[key] = value
     return schemas.DLQReplayReportResponse(**normalized)
 
-def _evaluate_ops_integration_status(db: Session) -> schemas.OpsIntegrationStatusResponse:
+
+def _evaluate_ops_integration_status(
+    db: Session,
+) -> schemas.OpsIntegrationStatusResponse:
     evidence: dict[str, object] = {}
 
     enums_ok = all(
         hasattr(enum_cls, "__members__") and len(enum_cls.__members__) > 0
-        for enum_cls in (models.IncidentStatus, models.NotificationStatus, models.AuditAction)
+        for enum_cls in (
+            models.IncidentStatus,
+            models.NotificationStatus,
+            models.AuditAction,
+        )
     )
     evidence["enums"] = {
         "incident_statuses": list(models.IncidentStatus.__members__.keys()),
@@ -1166,7 +1666,10 @@ def _evaluate_ops_integration_status(db: Session) -> schemas.OpsIntegrationStatu
         "audit_actions": list(models.AuditAction.__members__.keys()),
     }
 
-    fallback_contract_ok = "fallback_policy_json" in schemas.RuleCreate.model_fields and "fallback_policy_json" in schemas.RuleUpdate.model_fields
+    fallback_contract_ok = (
+        "fallback_policy_json" in schemas.RuleCreate.model_fields
+        and "fallback_policy_json" in schemas.RuleUpdate.model_fields
+    )
     evidence["fallback_contract"] = {
         "rule_create": "fallback_policy_json" in schemas.RuleCreate.model_fields,
         "rule_update": "fallback_policy_json" in schemas.RuleUpdate.model_fields,
@@ -1184,11 +1687,25 @@ def _evaluate_ops_integration_status(db: Session) -> schemas.OpsIntegrationStatu
         evidence["audit_logs_error"] = str(exc)
 
     trace_logs = [log for log in audit_logs if getattr(log, "trace_id", "")]
-    duplicate_events = [log for log in audit_logs if log.action == models.AuditAction.DUPLICATED_EVENT]
-    ack_logs = [log for log in audit_logs if log.action == models.AuditAction.ACK_RECEIVED]
-    acknowledged_incidents = [incident for incident in incidents if incident.status == models.IncidentStatus.ACKNOWLEDGED]
-    escalated_logs = [log for log in audit_logs if log.action == models.AuditAction.ESCALATED]
-    non_open_incidents = [incident for incident in incidents if incident.status != models.IncidentStatus.OPEN]
+    duplicate_events = [
+        log for log in audit_logs if log.action == models.AuditAction.DUPLICATED_EVENT
+    ]
+    ack_logs = [
+        log for log in audit_logs if log.action == models.AuditAction.ACK_RECEIVED
+    ]
+    acknowledged_incidents = [
+        incident
+        for incident in incidents
+        if incident.status == models.IncidentStatus.ACKNOWLEDGED
+    ]
+    escalated_logs = [
+        log for log in audit_logs if log.action == models.AuditAction.ESCALATED
+    ]
+    non_open_incidents = [
+        incident
+        for incident in incidents
+        if incident.status != models.IncidentStatus.OPEN
+    ]
     non_open_escalated = [
         incident
         for incident in non_open_incidents
@@ -1240,9 +1757,11 @@ def _evaluate_ops_integration_status(db: Session) -> schemas.OpsIntegrationStatu
         evidence=evidence,
     )
 
+
 @app.get("/ops/integration/status", response_model=schemas.OpsIntegrationStatusResponse)
 def get_ops_integration_status(db: Session = Depends(get_db)):
     return _evaluate_ops_integration_status(db)
+
 
 def _coerce_redis_text(value) -> str | None:
     if value is None:
@@ -1252,6 +1771,7 @@ def _coerce_redis_text(value) -> str | None:
     value = str(value).strip()
     return value or None
 
+
 def _get_heartbeat_snapshot() -> dict[str, dict[str, str | None]]:
     try:
         raw_metrics = redis_conn.hgetall(prefixed_redis_key(METRICS_KEY))
@@ -1259,7 +1779,9 @@ def _get_heartbeat_snapshot() -> dict[str, dict[str, str | None]]:
         return {"_error": {"error": str(exc)}}
 
     parsed = {
-        str(key.decode("utf-8") if isinstance(key, bytes) else key): _coerce_redis_text(value)
+        str(key.decode("utf-8") if isinstance(key, bytes) else key): _coerce_redis_text(
+            value
+        )
         for key, value in raw_metrics.items()
     }
 
@@ -1271,6 +1793,7 @@ def _get_heartbeat_snapshot() -> dict[str, dict[str, str | None]]:
         }
     return heartbeats
 
+
 def _evaluate_ops_readiness(db: Session) -> schemas.OpsReadinessResponse:
     integration = _evaluate_ops_integration_status(db)
     heartbeats = _get_heartbeat_snapshot()
@@ -1279,9 +1802,13 @@ def _evaluate_ops_readiness(db: Session) -> schemas.OpsReadinessResponse:
     blockers: list[str] = []
     score = 100
 
-    def add_check(name: str, passed: bool, details: str, weight: int, blocker: bool = False) -> None:
+    def add_check(
+        name: str, passed: bool, details: str, weight: int, blocker: bool = False
+    ) -> None:
         nonlocal score
-        checks.append(schemas.OpsReadinessCheck(name=name, passed=passed, details=details))
+        checks.append(
+            schemas.OpsReadinessCheck(name=name, passed=passed, details=details)
+        )
         if not passed:
             score -= weight
             if blocker:
@@ -1290,46 +1817,74 @@ def _evaluate_ops_readiness(db: Session) -> schemas.OpsReadinessResponse:
     add_check(
         "integration_enums",
         integration.enums_ok,
-        "Incident, notification and audit enums are available." if integration.enums_ok else "One or more enum classes are missing members.",
+        (
+            "Incident, notification and audit enums are available."
+            if integration.enums_ok
+            else "One or more enum classes are missing members."
+        ),
         20,
         blocker=True,
     )
     add_check(
         "fallback_contract",
         integration.fallback_contract_ok,
-        "Rule fallback policy contract is available." if integration.fallback_contract_ok else "Rule fallback policy contract is unavailable.",
+        (
+            "Rule fallback policy contract is available."
+            if integration.fallback_contract_ok
+            else "Rule fallback policy contract is unavailable."
+        ),
         15,
         blocker=True,
     )
     add_check(
         "trace_propagation",
         integration.trace_propagation_signal,
-        "Audit logs with trace_id were found." if integration.trace_propagation_signal else "No audit log with non-empty trace_id was found.",
+        (
+            "Audit logs with trace_id were found."
+            if integration.trace_propagation_signal
+            else "No audit log with non-empty trace_id was found."
+        ),
         10,
     )
     add_check(
         "duplicate_event_signal",
         integration.duplicate_event_signal,
-        "Duplicate event audit signal is present." if integration.duplicate_event_signal else "No duplicate event audit signal found.",
+        (
+            "Duplicate event audit signal is present."
+            if integration.duplicate_event_signal
+            else "No duplicate event audit signal found."
+        ),
         10,
     )
     add_check(
         "ack_flow_signal",
         integration.ack_flow_signal,
-        "Ack flow is observable via acknowledged incidents or ack logs." if integration.ack_flow_signal else "Ack flow signal is absent.",
+        (
+            "Ack flow is observable via acknowledged incidents or ack logs."
+            if integration.ack_flow_signal
+            else "Ack flow signal is absent."
+        ),
         15,
         blocker=True,
     )
     add_check(
         "escalation_guard_signal",
         integration.escalation_guard_signal,
-        "Escalation signal exists and no non-open incident was escalated unexpectedly." if integration.escalation_guard_signal else "Escalation guard signal is not satisfied.",
+        (
+            "Escalation signal exists and no non-open incident was escalated unexpectedly."
+            if integration.escalation_guard_signal
+            else "Escalation guard signal is not satisfied."
+        ),
         10,
     )
     add_check(
         "dlq_reporting_signal",
         integration.dlq_reporting_signal,
-        "DLQ replay report is available." if integration.dlq_reporting_signal else "DLQ replay report is missing or empty.",
+        (
+            "DLQ replay report is available."
+            if integration.dlq_reporting_signal
+            else "DLQ replay report is missing or empty."
+        ),
         15,
         blocker=True,
     )
@@ -1387,9 +1942,11 @@ def _evaluate_ops_readiness(db: Session) -> schemas.OpsReadinessResponse:
         evidence=evidence,
     )
 
+
 @app.get("/ops/readiness", response_model=schemas.OpsReadinessResponse)
 def get_ops_readiness(db: Session = Depends(get_db)):
     return _evaluate_ops_readiness(db)
+
 
 @app.get("/dispatch/voice/twiml/{notification_id}")
 @app.post("/dispatch/voice/twiml/{notification_id}")
@@ -1399,64 +1956,83 @@ def generate_twiml(notification_id: str, db: Session = Depends(get_db)):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Invalid notification id") from exc
 
-    notification = db.query(models.Notification).filter(models.Notification.id == notification_uuid).first()
+    notification = (
+        db.query(models.Notification)
+        .filter(models.Notification.id == notification_uuid)
+        .first()
+    )
     if not notification:
         raise HTTPException(status_code=404, detail="Not found")
-        
-    incident = db.query(models.Incident).filter(models.Incident.id == notification.incident_id).first()
+
+    incident = (
+        db.query(models.Incident)
+        .filter(models.Incident.id == notification.incident_id)
+        .first()
+    )
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
 
     trace_id = _get_or_create_trace_id(db, incident.id)
-    
+
     # Generate TwiML
-    twiml_response = f'''<?xml version="1.0" encoding="UTF-8"?>
+    twiml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say language="pt-BR" voice="Polly.Camila-Neural">
-        Atenção. Você tem um incidente crítico da fonte {incident.source}. {incident.title}. 
+        Atenção. Você tem um incidente crítico da fonte {incident.source}. {incident.title}.
         Pressione 1 para reconhecer o erro e assumir o incidente.
     </Say>
     <Gather numDigits="1" action="{APP_BASE_URL}/dispatch/voice/callback/{notification_id}" method="POST" />
-</Response>'''
-    
+</Response>"""
+
     # Audit log
     audit = models.AuditLog(
         trace_id=trace_id,
         incident_id=incident.id,
         action=models.AuditAction.TWIML_GENERATED,
-        details_json={"notification_id": notification_id}
+        details_json={"notification_id": notification_id},
     )
     db.add(audit)
     db.commit()
 
     return Response(content=twiml_response, media_type="application/xml")
 
+
 @app.get("/dispatch/voice/twiml/prerecorded/{notification_id}")
 @app.post("/dispatch/voice/twiml/prerecorded/{notification_id}")
 def generate_prerecorded_twiml(notification_id: str, db: Session = Depends(get_db)):
     if not VOICE_PRERECORDED_AUDIO_URL:
-        raise HTTPException(status_code=503, detail="Pre-recorded audio URL is not configured")
+        raise HTTPException(
+            status_code=503, detail="Pre-recorded audio URL is not configured"
+        )
 
     try:
         notification_uuid = uuid.UUID(notification_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Invalid notification id") from exc
 
-    notification = db.query(models.Notification).filter(models.Notification.id == notification_uuid).first()
+    notification = (
+        db.query(models.Notification)
+        .filter(models.Notification.id == notification_uuid)
+        .first()
+    )
     if not notification:
         raise HTTPException(status_code=404, detail="Not found")
 
-    incident = db.query(models.Incident).filter(models.Incident.id == notification.incident_id).first()
+    incident = (
+        db.query(models.Incident)
+        .filter(models.Incident.id == notification.incident_id)
+        .first()
+    )
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
 
     trace_id = _get_or_create_trace_id(db, incident.id)
-    twiml_response = f'''<?xml version="1.0" encoding="UTF-8"?>
+    twiml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Play>{VOICE_PRERECORDED_AUDIO_URL}</Play>
     <Gather numDigits="1" action="{APP_BASE_URL}/dispatch/voice/callback/{notification_id}" method="POST" />
     <Say language="pt-BR">Se necessário, repita a ligação com a equipe de plantão.</Say>
-</Response>'''
+</Response>"""
 
     db.add(
         models.AuditLog(
@@ -1472,6 +2048,7 @@ def generate_prerecorded_twiml(notification_id: str, db: Session = Depends(get_d
     )
     db.commit()
     return Response(content=twiml_response, media_type="application/xml")
+
 
 @app.post("/dispatch/voice/callback/{notification_id}")
 async def handle_voice_callback(
@@ -1495,11 +2072,15 @@ async def handle_voice_callback(
 
     form_data = await request.form()
     digits = form_data.get("Digits", "")
-    
-    notification = db.query(models.Notification).filter(models.Notification.id == notification_uuid).first()
+
+    notification = (
+        db.query(models.Notification)
+        .filter(models.Notification.id == notification_uuid)
+        .first()
+    )
     if not notification:
         return {"status": "ignored"}
-        
+
     incident = (
         db.query(models.Incident)
         .filter(models.Incident.id == notification.incident_id)
@@ -1526,24 +2107,47 @@ async def handle_voice_callback(
     )
     if not signature_ok:
         db.commit()
+        notify_event(
+            "seriema.voice.callback.rejected",
+            {
+                "incident_id": str(incident.id),
+                "notification_id": notification_id,
+                "reason": signature_reason,
+            },
+            level="warning",
+            trace_id=trace_id,
+        )
         raise HTTPException(status_code=401, detail="Invalid voice webhook signature")
-    
+
     if digits == "1" and incident.status == models.IncidentStatus.OPEN:
         incident.status = models.IncidentStatus.ACKNOWLEDGED
         incident.acknowledged_at = datetime.now(timezone.utc)
         incident.acknowledged_by = str(notification.contact_id)
         notification.status = models.NotificationStatus.ANSWERED_VOICE
-        
+
         # Log resolution
         audit = models.AuditLog(
             trace_id=trace_id,
             incident_id=incident.id,
             action=models.AuditAction.ACK_RECEIVED,
-            details_json={"channel": "VOICE", "digits": digits, "contact_id": str(notification.contact_id)}
+            details_json={
+                "channel": "VOICE",
+                "digits": digits,
+                "contact_id": str(notification.contact_id),
+            },
         )
         db.add(audit)
+        notify_event(
+            "seriema.voice.callback.ack_received",
+            {
+                "incident_id": str(incident.id),
+                "notification_id": notification_id,
+                "contact_id": str(notification.contact_id),
+            },
+            trace_id=trace_id,
+        )
     db.commit()
-    
+
     # We could play a confirmation message here
-    twiml_ack = '''<?xml version="1.0" encoding="UTF-8"?><Response><Say language="pt-BR">Incidente reconhecido com sucesso. Obrigado.</Say></Response>'''
+    twiml_ack = """<?xml version="1.0" encoding="UTF-8"?><Response><Say language="pt-BR">Incidente reconhecido com sucesso. Obrigado.</Say></Response>"""
     return Response(content=twiml_ack, media_type="application/xml")

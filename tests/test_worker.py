@@ -9,7 +9,6 @@ from pathlib import Path
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[1]
 PARENT = ROOT.parent
 if str(PARENT) not in sys.path:
@@ -263,7 +262,9 @@ class _FakeQuery:
             if key is None:
                 continue
             obj_value = getattr(obj, key)
-            operator_name = getattr(getattr(condition, "operator", None), "__name__", None)
+            operator_name = getattr(
+                getattr(condition, "operator", None), "__name__", None
+            )
             if operator_name in {"eq", None}:
                 if self._normalize(obj_value) != self._normalize(right):
                     return False
@@ -344,14 +345,18 @@ def _fresh_worker(
     monkeypatch.setenv("SERIEMA_CB_FAILURE_THRESHOLD", cb_failure_threshold)
     monkeypatch.setenv("SERIEMA_CB_OPEN_SECONDS", cb_open_seconds)
     monkeypatch.setenv("SERIEMA_CHANNEL_RATE_LIMIT_PER_MINUTE", rate_limit_per_minute)
-    monkeypatch.setenv("SERIEMA_CHANNEL_RATE_LIMIT_WINDOW_SECONDS", rate_limit_window_seconds)
+    monkeypatch.setenv(
+        "SERIEMA_CHANNEL_RATE_LIMIT_WINDOW_SECONDS", rate_limit_window_seconds
+    )
     monkeypatch.setenv("SERIEMA_OPS_MAX_LIMIT", "100")
     monkeypatch.setenv("SERIEMA_METRICS_KEY", "metrics:ops")
     monkeypatch.setenv("SERIEMA_METRICS_TTL_SECONDS", "120")
     monkeypatch.setenv("SERIEMA_METRICS_SNAPSHOT_INTERVAL_SECONDS", "60")
     monkeypatch.setenv("SERIEMA_DLQ_REPLAY_INTERVAL_SECONDS", "120")
     monkeypatch.setenv("REDIS_URL", "redis://localhost:56379/0")
-    monkeypatch.setenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:55432/eventsaas")
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgresql://postgres:postgres@localhost:55432/eventsaas"
+    )
     monkeypatch.setenv("SERIEMA_DB_SCHEMA", "seriema")
 
     for name in ["Seriema.config", "Seriema.redis_client", "Seriema.worker"]:
@@ -366,7 +371,9 @@ def _fresh_worker(
 
     monkeypatch.setattr(redis_client, "redis_conn", fake_redis, raising=False)
     monkeypatch.setattr(worker, "redis_conn", fake_redis, raising=False)
-    monkeypatch.setattr(worker, "SessionLocal", lambda: _FakeSession(fake_store), raising=False)
+    monkeypatch.setattr(
+        worker, "SessionLocal", lambda: _FakeSession(fake_store), raising=False
+    )
     return config, redis_client, worker
 
 
@@ -386,7 +393,9 @@ def test_queue_metrics_snapshot(monkeypatch):
     redis_client.redis_conn.rpush(worker.queue_name("dispatch"), "d1", "d2")
     redis_client.redis_conn.rpush(worker.queue_name("voice"), "v1")
     redis_client.redis_conn.rpush(worker.queue_name("telegram"), "t1", "t2", "t3")
-    redis_client.redis_conn.rpush(worker.DLQ_REDIS_KEY, json.dumps({"task_name": "voice_worker"}))
+    redis_client.redis_conn.rpush(
+        worker.DLQ_REDIS_KEY, json.dumps({"task_name": "voice_worker"})
+    )
 
     result = worker.queue_metrics_snapshot()
 
@@ -456,7 +465,10 @@ def test_replay_dlq_dry_run_does_not_remove_items(monkeypatch):
     assert result["replayed"] == 0
     assert result["remaining"] == 1
     assert result["limit"] == 2
-    assert result["candidates"] and result["candidates"][0]["notification_id"] == "notification-1"
+    assert (
+        result["candidates"]
+        and result["candidates"][0]["notification_id"] == "notification-1"
+    )
     report = redis_client.redis_conn.hgetall(worker.DLQ_REPLAY_REPORT_KEY)
     assert report[b"status"] == b"completed"
     assert report[b"candidates_count"] == b"1"
@@ -713,7 +725,9 @@ def test_voice_circuit_opens_and_skips_while_open(monkeypatch):
 
     assert first["opened"] is False
     assert second["opened"] is True
-    assert redis_client.redis_conn.exists(worker._channel_circuit_open_key("VOICE")) == 1
+    assert (
+        redis_client.redis_conn.exists(worker._channel_circuit_open_key("VOICE")) == 1
+    )
 
     from Seriema import models
 
@@ -745,7 +759,9 @@ def test_voice_circuit_opens_and_skips_while_open(monkeypatch):
         db.close()
 
     def _fail_if_called(*args, **kwargs):
-        raise AssertionError("mark_notification_sent should not be called while circuit is open")
+        raise AssertionError(
+            "mark_notification_sent should not be called while circuit is open"
+        )
 
     monkeypatch.setattr(worker, "_mark_notification_sent", _fail_if_called)
     result = worker._send_voice_call_impl(str(notification.id), "trace-circuit")
@@ -767,7 +783,10 @@ def test_success_resets_channel_failure_counter(monkeypatch):
     _clear_prefix(redis_client.redis_conn, prefix)
 
     worker._record_channel_failure(worker.NotificationChannel.VOICE)
-    assert redis_client.redis_conn.get(worker._channel_circuit_failure_key("VOICE")) == b"1"
+    assert (
+        redis_client.redis_conn.get(worker._channel_circuit_failure_key("VOICE"))
+        == b"1"
+    )
 
     from Seriema import models
 
@@ -801,7 +820,10 @@ def test_success_resets_channel_failure_counter(monkeypatch):
     result = worker._send_voice_call_impl(str(notification.id), "trace-success")
 
     assert result["status"] == "sent"
-    assert redis_client.redis_conn.get(worker._channel_circuit_failure_key("VOICE")) is None
+    assert (
+        redis_client.redis_conn.get(worker._channel_circuit_failure_key("VOICE"))
+        is None
+    )
 
 
 def test_rate_limit_allows_first_send_and_blocks_second(monkeypatch):
@@ -859,19 +881,31 @@ def test_rate_limit_allows_first_send_and_blocks_second(monkeypatch):
     assert second_result["status"] == "skipped_rate_limit"
     assert second_result["rate_limit"]["limit"] == 1
     assert second_result["rate_limit"]["count"] == 2
-    assert redis_client.redis_conn.get(worker._channel_circuit_failure_key("VOICE")) is None
+    assert (
+        redis_client.redis_conn.get(worker._channel_circuit_failure_key("VOICE"))
+        is None
+    )
 
 
 def test_voice_twiml_url_prerecorded_mode(monkeypatch):
     prefix = f"pytest:{uuid.uuid4().hex}"
     _, _, worker = _fresh_worker(monkeypatch, prefix=prefix, dry_run="true")
 
-    monkeypatch.setattr(worker, "APP_BASE_URL", "https://seriema.example.com", raising=False)
+    monkeypatch.setattr(
+        worker, "APP_BASE_URL", "https://seriema.example.com", raising=False
+    )
     monkeypatch.setattr(worker, "VOICE_TWIML_MODE", "prerecorded", raising=False)
-    monkeypatch.setattr(worker, "VOICE_PRERECORDED_AUDIO_URL", "https://cdn.example.com/alert.mp3", raising=False)
+    monkeypatch.setattr(
+        worker,
+        "VOICE_PRERECORDED_AUDIO_URL",
+        "https://cdn.example.com/alert.mp3",
+        raising=False,
+    )
 
     url = worker._voice_twiml_url("00000000-0000-0000-0000-00000000abcd")
-    assert url.endswith("/dispatch/voice/twiml/prerecorded/00000000-0000-0000-0000-00000000abcd")
+    assert url.endswith(
+        "/dispatch/voice/twiml/prerecorded/00000000-0000-0000-0000-00000000abcd"
+    )
 
 
 def test_send_voice_call_twilio_sets_external_provider_id(monkeypatch):
@@ -881,7 +915,9 @@ def test_send_voice_call_twilio_sets_external_provider_id(monkeypatch):
     _clear_prefix(redis_client.redis_conn, prefix)
 
     monkeypatch.setattr(worker, "VOICE_PROVIDER", "twilio", raising=False)
-    monkeypatch.setattr(worker, "APP_BASE_URL", "https://seriema.example.com", raising=False)
+    monkeypatch.setattr(
+        worker, "APP_BASE_URL", "https://seriema.example.com", raising=False
+    )
     monkeypatch.setattr(worker, "VOICE_TWIML_MODE", "dynamic", raising=False)
 
     captured = {}
@@ -917,7 +953,8 @@ def test_send_voice_call_twilio_sets_external_provider_id(monkeypatch):
         db.refresh(notification)
         assert notification.external_provider_id == "CA00000000000000000000000000000001"
         assert captured["phone"] == "+5511999999999"
-        assert captured["twiml_url"].endswith(f"/dispatch/voice/twiml/{notification.id}")
+        assert f"/dispatch/voice/twiml/{notification.id}" in captured["twiml_url"]
+        assert "trace_id=trace-twilio" in captured["twiml_url"]
     finally:
         db.close()
 
@@ -933,7 +970,9 @@ def test_handle_escalation_invalid_fallback_policy_records_failed_audit(monkeypa
     db = worker.SessionLocal()
     try:
         group = models.Group(name=f"Fallback-{uuid.uuid4().hex}")
-        contact = models.Contact(name="Escalation Contact", email="escalation@example.com")
+        contact = models.Contact(
+            name="Escalation Contact", email="escalation@example.com"
+        )
         incident = models.Incident(
             external_event_id=f"evt-{uuid.uuid4().hex}",
             source="pytest",
@@ -975,17 +1014,27 @@ def test_handle_escalation_invalid_fallback_policy_records_failed_audit(monkeypa
 
     db = worker.SessionLocal()
     try:
-        logs = db.query(models.AuditLog).filter(models.AuditLog.incident_id == incident.id).all()
+        logs = (
+            db.query(models.AuditLog)
+            .filter(models.AuditLog.incident_id == incident.id)
+            .all()
+        )
         assert any(log.action == models.AuditAction.ESCALATED for log in logs)
         failed_logs = [
-            log for log in logs
+            log
+            for log in logs
             if log.action == models.AuditAction.FAILED
             and log.details_json.get("reason") == "invalid_fallback_policy"
         ]
         assert failed_logs
-        assert failed_logs[0].details_json["diagnostic"]["invalid_field"] == "escalation_group_id"
+        assert (
+            failed_logs[0].details_json["diagnostic"]["invalid_field"]
+            == "escalation_group_id"
+        )
         assert failed_logs[0].details_json["diagnostic"]["policy_type"] == "dict"
-        assert not any(log.action == models.AuditAction.FALLBACK_TASK_QUEUED for log in logs)
+        assert not any(
+            log.action == models.AuditAction.FALLBACK_TASK_QUEUED for log in logs
+        )
     finally:
         db.close()
 
@@ -1002,13 +1051,17 @@ def test_handle_escalation_valid_policy_keeps_fallback_behavior(monkeypatch):
     monkeypatch.setattr(
         worker,
         "_queue_channel_send",
-        lambda notification_id, trace_id, channel: queued.append((notification_id, trace_id, channel)),
+        lambda notification_id, trace_id, channel: queued.append(
+            (notification_id, trace_id, channel)
+        ),
     )
 
     db = worker.SessionLocal()
     try:
         group = models.Group(name=f"Fallback-{uuid.uuid4().hex}")
-        contact = models.Contact(name="Escalation Contact", email="escalation@example.com")
+        contact = models.Contact(
+            name="Escalation Contact", email="escalation@example.com"
+        )
         incident = models.Incident(
             external_event_id=f"evt-{uuid.uuid4().hex}",
             source="pytest",
@@ -1056,9 +1109,15 @@ def test_handle_escalation_valid_policy_keeps_fallback_behavior(monkeypatch):
 
     db = worker.SessionLocal()
     try:
-        logs = db.query(models.AuditLog).filter(models.AuditLog.incident_id == incident.id).all()
+        logs = (
+            db.query(models.AuditLog)
+            .filter(models.AuditLog.incident_id == incident.id)
+            .all()
+        )
         assert any(log.action == models.AuditAction.ESCALATED for log in logs)
-        assert any(log.action == models.AuditAction.FALLBACK_TASK_QUEUED for log in logs)
+        assert any(
+            log.action == models.AuditAction.FALLBACK_TASK_QUEUED for log in logs
+        )
         assert not any(
             log.action == models.AuditAction.FAILED
             and log.details_json.get("reason") == "invalid_fallback_policy"
@@ -1078,7 +1137,9 @@ def test_dispatch_incident_reprocess_does_not_duplicate_notifications(monkeypatc
     monkeypatch.setattr(
         worker,
         "_queue_channel_send",
-        lambda notification_id, trace_id, channel: queued.append((notification_id, trace_id, channel)),
+        lambda notification_id, trace_id, channel: queued.append(
+            (notification_id, trace_id, channel)
+        ),
     )
 
     from Seriema import models
@@ -1127,7 +1188,11 @@ def test_dispatch_incident_reprocess_does_not_duplicate_notifications(monkeypatc
 
     db = worker.SessionLocal()
     try:
-        notifications = db.query(models.Notification).filter(models.Notification.incident_id == incident.id).all()
+        notifications = (
+            db.query(models.Notification)
+            .filter(models.Notification.incident_id == incident.id)
+            .all()
+        )
         assert len(notifications) == 1
         assert str(notifications[0].contact_id) == str(contact.id)
         assert notifications[0].channel == worker.NotificationChannel.VOICE
@@ -1158,7 +1223,9 @@ def test_handle_escalation_non_open_incident_is_noop(monkeypatch, initial_status
     db = worker.SessionLocal()
     try:
         group = models.Group(name=f"Escalation-{uuid.uuid4().hex}")
-        contact = models.Contact(name="Escalation Contact", email="escalation@example.com")
+        contact = models.Contact(
+            name="Escalation Contact", email="escalation@example.com"
+        )
         incident = models.Incident(
             external_event_id=f"evt-{uuid.uuid4().hex}",
             source="pytest",
@@ -1203,9 +1270,17 @@ def test_handle_escalation_non_open_incident_is_noop(monkeypatch, initial_status
 
     db = worker.SessionLocal()
     try:
-        logs = db.query(models.AuditLog).filter(models.AuditLog.incident_id == incident.id).all()
+        logs = (
+            db.query(models.AuditLog)
+            .filter(models.AuditLog.incident_id == incident.id)
+            .all()
+        )
         assert logs == []
-        notifications = db.query(models.Notification).filter(models.Notification.incident_id == incident.id).all()
+        notifications = (
+            db.query(models.Notification)
+            .filter(models.Notification.incident_id == incident.id)
+            .all()
+        )
         assert notifications == []
     finally:
         db.close()
@@ -1271,9 +1346,14 @@ def test_stale_incident_sweeper_escalates_only_old_open_incidents(monkeypatch):
         assert recent_open.status == worker.IncidentStatus.OPEN
         assert acknowledged.status == worker.IncidentStatus.ACKNOWLEDGED
 
-        logs = db.query(models.AuditLog).filter(models.AuditLog.incident_id == old_open.id).all()
+        logs = (
+            db.query(models.AuditLog)
+            .filter(models.AuditLog.incident_id == old_open.id)
+            .all()
+        )
         assert any(
-            log.action == models.AuditAction.ESCALATED and log.details_json.get("reason") == "stale_sweeper"
+            log.action == models.AuditAction.ESCALATED
+            and log.details_json.get("reason") == "stale_sweeper"
             for log in logs
         )
     finally:
@@ -1285,6 +1365,7 @@ def test_stale_incident_sweeper_escalates_only_old_open_incidents(monkeypatch):
     assert b"last_run_at:stale_incident_sweeper" in metrics
     assert int(metrics[b"duration_ms:stale_incident_sweeper"]) >= 0
 
+
 def test_send_voice_call_signalwire_sets_external_provider_id(monkeypatch):
     prefix = f"pytest:{uuid.uuid4().hex}"
     _, redis_client, worker = _fresh_worker(monkeypatch, prefix=prefix, dry_run="true")
@@ -1292,7 +1373,9 @@ def test_send_voice_call_signalwire_sets_external_provider_id(monkeypatch):
     _clear_prefix(redis_client.redis_conn, prefix)
 
     monkeypatch.setattr(worker, "VOICE_PROVIDER", "signalwire", raising=False)
-    monkeypatch.setattr(worker, "APP_BASE_URL", "https://seriema.example.com", raising=False)
+    monkeypatch.setattr(
+        worker, "APP_BASE_URL", "https://seriema.example.com", raising=False
+    )
     monkeypatch.setattr(worker, "VOICE_TWIML_MODE", "dynamic", raising=False)
 
     captured = {}
@@ -1302,7 +1385,9 @@ def test_send_voice_call_signalwire_sets_external_provider_id(monkeypatch):
         captured["twiml_url"] = twiml_url
         return "CA0000000000000000000000000000SW01"
 
-    monkeypatch.setattr(worker, "_call_signalwire_voice", _fake_signalwire, raising=False)
+    monkeypatch.setattr(
+        worker, "_call_signalwire_voice", _fake_signalwire, raising=False
+    )
 
     db = worker.SessionLocal()
     try:
@@ -1328,6 +1413,7 @@ def test_send_voice_call_signalwire_sets_external_provider_id(monkeypatch):
         db.refresh(notification)
         assert notification.external_provider_id == "CA0000000000000000000000000000SW01"
         assert captured["phone"] == "+5511988888888"
-        assert captured["twiml_url"].endswith(f"/dispatch/voice/twiml/{notification.id}")
+        assert f"/dispatch/voice/twiml/{notification.id}" in captured["twiml_url"]
+        assert "trace_id=trace-signalwire" in captured["twiml_url"]
     finally:
         db.close()
