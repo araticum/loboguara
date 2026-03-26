@@ -1,4 +1,4 @@
-# oasis-radar — observabilidade mínima do Oásis
+Lobo-Guará — observabilidade mínima do Oásis
 
 Pacote enxuto para deploy em **stack separada** via Docker Compose/Portainer com:
 - Loki (armazenamento e busca de logs)
