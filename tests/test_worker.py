@@ -1656,6 +1656,12 @@ def test_send_telegram_message_suppresses_duplicates_within_window(monkeypatch):
         return f"tg-msg-{len(sent_messages)}"
 
     monkeypatch.setattr(worker, "_send_telegram_via_bot_api", _fake_send, raising=False)
+    monkeypatch.setattr(
+        worker,
+        "_render_notification_template",
+        lambda rule, incident, channel: "dedupe preview",
+        raising=False,
+    )
 
     db = worker.SessionLocal()
     try:
@@ -1793,7 +1799,7 @@ def test_render_notification_template_escapes_telegram_markdown(monkeypatch):
 
     rendered = worker._render_notification_template(None, incident, "TELEGRAM")
 
-    assert "Falha\\_\\(db\\)\\[prod\\]\! \\#1" in rendered
+    assert r"Falha\_\(db\)\[prod\]\! \#1" in rendered
     assert "pytest\\[source\\]\\_v2" in rendered
     assert "*Serviço*" not in rendered
     assert "\\*Serviço\\*" in rendered
