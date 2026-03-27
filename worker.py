@@ -191,6 +191,11 @@ def _source_label(source: str) -> str:
     return _SOURCE_LABEL_MAP.get(source, source)
 
 
+def _escape_telegram_markdown_v2(text: str) -> str:
+    escaped_chars = "\\_*[]()~`>#+-=|{}.!"
+    return "".join(f"\\{char}" if char in escaped_chars else char for char in text)
+
+
 def _render_notification_template(
     rule: Rule | None,
     incident: Incident,
@@ -208,7 +213,7 @@ def _render_notification_template(
     incident_short = str(incident.id)[:8]
 
     if not template and channel.upper() == "TELEGRAM":
-        return (
+        template = (
             f"*Serviço*: {service}\n"
             f"*Nível*: {emoji} {severity}\n"
             f"*Objeto*: {incident.title}\n"
@@ -228,9 +233,13 @@ def _render_notification_template(
         "runbook_url": getattr(rule, "runbook_url", "") or "",
     }
     try:
-        return str(template).format(**values)
+        rendered = str(template).format(**values)
     except Exception:
-        return str(template)
+        rendered = str(template)
+
+    if channel.upper() == "TELEGRAM":
+        return _escape_telegram_markdown_v2(rendered)
+    return rendered
 
 
 def _get_channel_retry_policy(
@@ -369,7 +378,7 @@ def _send_telegram_via_bot_api(chat_id: str, text: str) -> str:
         {
             "chat_id": str(chat_id),
             "text": text,
-            "parse_mode": "Markdown",
+            "parse_mode": "MarkdownV2",
             "disable_web_page_preview": True,
         }
     ).encode("utf-8")

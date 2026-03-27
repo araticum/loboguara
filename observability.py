@@ -46,6 +46,13 @@ def init_observability() -> None:
             logger.warning("Failed to initialize Langfuse: %s", exc)
 
 
+def _normalize_langfuse_trace_id(trace_id: str | None) -> str | None:
+    if not trace_id:
+        return None
+    normalized = trace_id.replace("-", "")
+    return normalized or None
+
+
 def _send_langfuse_event(
     name: str,
     payload: dict[str, Any],
@@ -57,12 +64,13 @@ def _send_langfuse_event(
 
     try:
         langfuse_level = level.upper()
+        normalized_trace_id = _normalize_langfuse_trace_id(trace_id)
 
-        if trace_id:
+        if normalized_trace_id:
             with _langfuse_client.start_as_current_observation(
                 name="seriema.event",
                 as_type="span",
-                trace_context={"trace_id": trace_id},
+                trace_context={"trace_id": normalized_trace_id},
                 metadata={"source": "seriema", "event_name": name},
                 level=langfuse_level,
             ) as trace_span:

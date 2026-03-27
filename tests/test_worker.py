@@ -1537,6 +1537,29 @@ def test_send_telegram_message_falls_back_to_logs_group(monkeypatch):
         db.close()
 
 
+def test_render_notification_template_escapes_telegram_markdown(monkeypatch):
+    prefix = f"pytest:{uuid.uuid4().hex}"
+    _, redis_client, worker = _fresh_worker(monkeypatch, prefix=prefix, dry_run="true")
+
+    _clear_prefix(redis_client.redis_conn, prefix)
+
+    incident = worker.Incident(
+        external_event_id=f"evt-{uuid.uuid4().hex}",
+        source="pytest[source]_v2",
+        severity="HIGH",
+        title="Falha_(db)[prod]! #1",
+        message="payload with *markdown* and dots.",
+        status=worker.IncidentStatus.OPEN,
+    )
+
+    rendered = worker._render_notification_template(None, incident, "TELEGRAM")
+
+    assert "Falha\\_\\(db\\)\\[prod\\]\! \\#1" in rendered
+    assert "pytest\\[source\\]\\_v2" in rendered
+    assert "*Serviço*" not in rendered
+    assert "\\*Serviço\\*" in rendered
+
+
 def test_send_email_message_fails_gracefully_when_resend_missing(monkeypatch):
     prefix = f"pytest:{uuid.uuid4().hex}"
     _, redis_client, worker = _fresh_worker(monkeypatch, prefix=prefix, dry_run="true")
