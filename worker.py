@@ -142,7 +142,10 @@ def _channel_enabled_for_incident(
     incident: Incident, channel: NotificationChannel | str
 ) -> bool:
     channel_value = _notification_channel_value(channel).upper()
-    if channel_value == NotificationChannel.TELEGRAM.value:
+    if channel_value in {
+        NotificationChannel.TELEGRAM.value,
+        NotificationChannel.EMAIL.value,
+    }:
         return _incident_severity_value(incident) != "INFO"
     return True
 

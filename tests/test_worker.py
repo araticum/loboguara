@@ -1049,7 +1049,7 @@ def test_handle_escalation_invalid_fallback_policy_records_failed_audit(monkeypa
         db.close()
 
 
-def test_handle_escalation_skips_telegram_for_info_severity(monkeypatch):
+def test_handle_escalation_skips_telegram_and_email_for_info_severity(monkeypatch):
     prefix = f"pytest:{uuid.uuid4().hex}"
     _, redis_client, worker = _fresh_worker(monkeypatch, prefix=prefix, dry_run="true")
 
@@ -1078,7 +1078,7 @@ def test_handle_escalation_skips_telegram_for_info_severity(monkeypatch):
             external_event_id=f"evt-{uuid.uuid4().hex}",
             source="pytest",
             severity="INFO",
-            title="escalation-info-telegram",
+            title="escalation-info-message-channels",
             status=worker.IncidentStatus.OPEN,
         )
         db.add(group)
@@ -1116,8 +1116,7 @@ def test_handle_escalation_skips_telegram_for_info_severity(monkeypatch):
 
     assert result is True
     assert incident.status == worker.IncidentStatus.ESCALATED
-    assert len(queued) == 1
-    assert queued[0][2] == worker.NotificationChannel.EMAIL
+    assert queued == []
 
     db = worker.SessionLocal()
     try:
@@ -1126,8 +1125,7 @@ def test_handle_escalation_skips_telegram_for_info_severity(monkeypatch):
             .filter(models.Notification.incident_id == incident.id)
             .all()
         )
-        assert len(notifications) == 1
-        assert notifications[0].channel == worker.NotificationChannel.EMAIL
+        assert notifications == []
     finally:
         db.close()
 
@@ -1220,7 +1218,7 @@ def test_handle_escalation_valid_policy_keeps_fallback_behavior(monkeypatch):
         db.close()
 
 
-def test_dispatch_incident_skips_telegram_for_info_severity(monkeypatch):
+def test_dispatch_incident_skips_telegram_and_email_for_info_severity(monkeypatch):
     prefix = f"pytest:{uuid.uuid4().hex}"
     _, redis_client, worker = _fresh_worker(monkeypatch, prefix=prefix, dry_run="true")
 
@@ -1249,7 +1247,7 @@ def test_dispatch_incident_skips_telegram_for_info_severity(monkeypatch):
             external_event_id=f"evt-{uuid.uuid4().hex}",
             source="pytest",
             severity="INFO",
-            title="dispatch-info-telegram",
+            title="dispatch-info-message-channels",
             status=worker.IncidentStatus.OPEN,
         )
         db.add(group)
@@ -1289,15 +1287,8 @@ def test_dispatch_incident_skips_telegram_for_info_severity(monkeypatch):
             .filter(models.Notification.incident_id == incident.id)
             .all()
         )
-        assert len(notifications) == 1
-        assert notifications[0].channel == worker.NotificationChannel.EMAIL
-        assert queued == [
-            (
-                str(notifications[0].id),
-                "trace-dispatch-info",
-                worker.NotificationChannel.EMAIL,
-            )
-        ]
+        assert notifications == []
+        assert queued == []
     finally:
         db.close()
 
