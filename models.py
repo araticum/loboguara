@@ -130,6 +130,7 @@ class Incident(Base):
     )
     matched_rule_id = Column(UUID(as_uuid=True), ForeignKey("rules.id"), nullable=True)
     dedupe_key = Column(String, nullable=True, index=True)
+    occurrences = Column(Integer, nullable=False, default=1, server_default="1")
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())

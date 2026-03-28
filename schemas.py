@@ -280,6 +280,7 @@ class IncidentResponse(BaseModel):
     status: IncidentStatus
     matched_rule_id: Optional[uuid.UUID] = None
     dedupe_key: Optional[str] = None
+    occurrences: int = 1
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     acknowledged_at: Optional[datetime] = None

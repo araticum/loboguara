@@ -6,6 +6,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from datetime import timedelta
+from typing import Any
 from urllib.error import HTTPError, URLError
 
 import httpx
@@ -64,6 +65,17 @@ from .config import (
     OASIS_RADAR_PULL_INTERVAL_SECONDS,
     OASIS_RADAR_PULL_LIMIT,
     OASIS_RADAR_LOOKBACK_SECONDS,
+    LANGFUSE_HOST,
+    LANGFUSE_PUBLIC_KEY,
+    LANGFUSE_SECRET_KEY,
+    LANGFUSE_PULL_CURSOR_KEY,
+    LANGFUSE_PULL_ENABLED,
+    LANGFUSE_PULL_INTERVAL_SECONDS,
+    SENTRY_API_TOKEN,
+    SENTRY_ORG_SLUG,
+    SENTRY_PULL_CURSOR_KEY,
+    SENTRY_PULL_ENABLED,
+    SENTRY_PULL_INTERVAL_SECONDS,
     queue_name,
     prefixed_redis_key,
 )
@@ -87,6 +99,10 @@ DLQ_REDIS_KEY = prefixed_redis_key(DLQ_QUEUE_NAME)
 DLQ_REPLAY_LOCK_KEY = prefixed_redis_key(f"{DLQ_QUEUE_NAME}:replay:lock")
 METRICS_REDIS_KEY = prefixed_redis_key(METRICS_KEY)
 DLQ_REPLAY_REPORT_KEY = prefixed_redis_key(f"{METRICS_KEY}:dlq_replay_last")
+TELEGRAM_SERVICE_RATE_LIMIT = 5
+TELEGRAM_SERVICE_RATE_LIMIT_WINDOW_SECONDS = 3600
+TELEGRAM_DIGEST_INTERVAL_SECONDS = 3600
+TELEGRAM_DIGEST_BUFFER_KEY = prefixed_redis_key("telegram:digest:buffer")
 
 celery_app = Celery("event_saas", broker=REDIS_URL, backend=REDIS_URL)
 init_observability()
@@ -108,6 +124,9 @@ celery_app.conf.update(
         "replay_dlq": {"queue": queue_name(DLQ_QUEUE_NAME)},
         "prune_dlq": {"queue": queue_name(DLQ_QUEUE_NAME)},
         "oasis_radar_pull_worker": {"queue": queue_name("dispatch")},
+        "sentry_pull_worker": {"queue": queue_name("dispatch")},
+        "langfuse_pull_worker": {"queue": queue_name("dispatch")},
+        "telegram_digest_worker": {"queue": queue_name("dispatch")},
         "queue_metrics_snapshot": {"queue": queue_name("dispatch")},
     },
     beat_schedule={
@@ -126,6 +145,18 @@ celery_app.conf.update(
         "oasis-radar-pull": {
             "task": "oasis_radar_pull_worker",
             "schedule": OASIS_RADAR_PULL_INTERVAL_SECONDS,
+        },
+        "sentry-pull": {
+            "task": "sentry_pull_worker",
+            "schedule": SENTRY_PULL_INTERVAL_SECONDS,
+        },
+        "langfuse-pull": {
+            "task": "langfuse_pull_worker",
+            "schedule": LANGFUSE_PULL_INTERVAL_SECONDS,
+        },
+        "telegram-digest": {
+            "task": "telegram_digest_worker",
+            "schedule": TELEGRAM_DIGEST_INTERVAL_SECONDS,
         },
     },
 )
@@ -747,6 +778,284 @@ def _touch_metrics(fields: dict[str, int | str]) -> None:
     pipe.execute()
 
 
+def _json_default(value: Any) -> str:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _severity_from_sentry_level(level: str | None) -> str:
+    normalized = str(level or "error").strip().lower()
+    mapping = {
+        "fatal": "FATAL",
+        "error": "ERROR",
+        "warning": "WARN",
+        "info": "INFO",
+    }
+    return mapping.get(normalized, normalized.upper() or "ERROR")
+
+
+def _severity_from_langfuse_observation(obs: dict[str, Any]) -> str:
+    level = str(obs.get("level") or "").strip().upper()
+    if level:
+        return level
+    if obs.get("statusMessage"):
+        return "ERROR"
+    return "INFO"
+
+
+def _parse_langfuse_timestamp(value: str | None) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    normalized = raw.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _load_worker_modules():
+    from . import main as main_module
+    from . import schemas as schemas_module
+
+    return main_module, schemas_module
+
+
+def _sentry_headers() -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {SENTRY_API_TOKEN}",
+        "Accept": "application/json",
+    }
+
+
+def _list_sentry_projects() -> list[str]:
+    response = httpx.get(
+        f"https://sentry.io/api/0/organizations/{SENTRY_ORG_SLUG}/projects/",
+        headers=_sentry_headers(),
+        timeout=20,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list):
+        return []
+    return [
+        str(item.get("slug")).strip()
+        for item in payload
+        if isinstance(item, dict) and str(item.get("slug") or "").strip()
+    ]
+
+
+def _buffer_telegram_digest(incident: Incident, message_preview: str | None) -> None:
+    service = str(getattr(incident, "service", "") or "unknown")
+    item = {
+        "incident_id": str(getattr(incident, "id", "")),
+        "title": str(getattr(incident, "title", "") or ""),
+        "severity": str(getattr(incident, "severity", "") or ""),
+        "source": str(getattr(incident, "source", "") or ""),
+        "occurrences": int(getattr(incident, "occurrences", 1) or 1),
+        "message_preview": str(message_preview or "")[:500],
+        "suppressed_at": _utc_now().isoformat(),
+    }
+    redis_conn.hset(
+        TELEGRAM_DIGEST_BUFFER_KEY, service, json.dumps(item, default=_json_default)
+    )
+    redis_conn.expire(
+        TELEGRAM_DIGEST_BUFFER_KEY, TELEGRAM_SERVICE_RATE_LIMIT_WINDOW_SECONDS * 2
+    )
+
+
+def _telegram_service_rate_limit_key(service: str) -> str:
+    normalized = str(service or "unknown").strip() or "unknown"
+    return prefixed_redis_key(f"ratelimit:telegram:{normalized}")
+
+
+def _telegram_service_rate_limit_state(service: str) -> dict[str, int | bool | str]:
+    key = _telegram_service_rate_limit_key(service)
+    count = redis_conn.incr(key)
+    if count == 1:
+        redis_conn.expire(key, TELEGRAM_SERVICE_RATE_LIMIT_WINDOW_SECONDS)
+    return {
+        "service": service or "unknown",
+        "count": count,
+        "limit": TELEGRAM_SERVICE_RATE_LIMIT,
+        "window_seconds": TELEGRAM_SERVICE_RATE_LIMIT_WINDOW_SECONDS,
+        "exceeded": count > TELEGRAM_SERVICE_RATE_LIMIT,
+    }
+
+
+def _send_telegram_digest_impl() -> dict[str, Any]:
+    buffered = redis_conn.hgetall(TELEGRAM_DIGEST_BUFFER_KEY)
+    if not buffered:
+        return {"status": "ok", "digests_sent": 0}
+
+    sent = 0
+    for raw_service, raw_payload in buffered.items():
+        service = (
+            raw_service.decode("utf-8")
+            if isinstance(raw_service, bytes)
+            else str(raw_service)
+        )
+        payload_raw = (
+            raw_payload.decode("utf-8")
+            if isinstance(raw_payload, bytes)
+            else str(raw_payload)
+        )
+        try:
+            payload = json.loads(payload_raw)
+        except json.JSONDecodeError:
+            payload = {"message_preview": payload_raw}
+        text = (
+            "*Digest de alertas suprimidos*\n"
+            f"*Serviço*: {_escape_telegram_markdown_v2(service)}\n"
+            f"*Título*: {_escape_telegram_markdown_v2(str(payload.get('title') or 'sem título'))}\n"
+            f"*Severidade*: {_escape_telegram_markdown_v2(str(payload.get('severity') or 'ERROR'))}\n"
+            f"*Ocorrências*: {_escape_telegram_markdown_v2(str(payload.get('occurrences') or 1))}\n"
+            f"*Última supressão*: {_escape_telegram_markdown_v2(str(payload.get('suppressed_at') or ''))}"
+        )
+        _send_telegram_via_bot_api(str(TELEGRAM_LOGS_CHAT_ID), text)
+        sent += 1
+    redis_conn.delete(TELEGRAM_DIGEST_BUFFER_KEY)
+    return {"status": "ok", "digests_sent": sent}
+
+
+def _pull_sentry_impl() -> dict[str, Any]:
+    if not SENTRY_PULL_ENABLED:
+        return {"status": "skipped", "reason": "disabled"}
+    if not SENTRY_API_TOKEN.strip():
+        return {"status": "skipped", "reason": "missing_api_token"}
+
+    main_module, schemas_module = _load_worker_modules()
+    last_seen = int(
+        (redis_conn.get(prefixed_redis_key(SENTRY_PULL_CURSOR_KEY)) or b"0").decode(
+            "utf-8"
+        )
+    )
+    max_seen = last_seen
+    fetched = 0
+    ingested = 0
+    with SessionLocal() as db:
+        for project in _list_sentry_projects():
+            response = httpx.get(
+                f"https://sentry.io/api/0/projects/{SENTRY_ORG_SLUG}/{project}/issues/",
+                headers=_sentry_headers(),
+                params={"query": "is:unresolved", "sort": "date", "limit": 25},
+                timeout=20,
+            )
+            response.raise_for_status()
+            issues = response.json()
+            if not isinstance(issues, list):
+                continue
+            for issue in sorted(issues, key=lambda item: int(str(item.get("id") or 0))):
+                fetched += 1
+                issue_id = int(str(issue.get("id") or 0))
+                if issue_id <= last_seen:
+                    continue
+                event = schemas_module.EventIncoming(
+                    source="sentry",
+                    service=str(((issue.get("project") or {}).get("slug")) or project),
+                    severity=_severity_from_sentry_level(issue.get("level")),
+                    title=str(issue.get("title") or "Sentry issue"),
+                    message=str(issue.get("culprit") or issue.get("shortId") or ""),
+                    payload_json=issue,
+                    dedupe_key=f"sentry:{issue['id']}",
+                    external_event_id=f"sentry-{issue['id']}",
+                )
+                main_module.ingest_event(event=event, db=db)
+                ingested += 1
+                max_seen = max(max_seen, issue_id)
+    if max_seen > last_seen:
+        redis_conn.set(
+            prefixed_redis_key(SENTRY_PULL_CURSOR_KEY), str(max_seen), ex=None
+        )
+    return {
+        "status": "ok",
+        "fetched": fetched,
+        "ingested": ingested,
+        "last_seen_issue_id": max_seen,
+    }
+
+
+def _pull_langfuse_impl() -> dict[str, Any]:
+    if not LANGFUSE_PULL_ENABLED:
+        return {"status": "skipped", "reason": "disabled"}
+    if not (
+        LANGFUSE_PUBLIC_KEY.strip()
+        and LANGFUSE_SECRET_KEY.strip()
+        and LANGFUSE_HOST.strip()
+    ):
+        return {"status": "skipped", "reason": "missing_credentials"}
+
+    main_module, schemas_module = _load_worker_modules()
+    now = _utc_now()
+    raw_last_check = redis_conn.get(prefixed_redis_key(LANGFUSE_PULL_CURSOR_KEY))
+    if raw_last_check is None:
+        last_check = now - timedelta(seconds=LANGFUSE_PULL_INTERVAL_SECONDS)
+    else:
+        decoded = (
+            raw_last_check.decode("utf-8")
+            if isinstance(raw_last_check, bytes)
+            else str(raw_last_check)
+        )
+        last_check = _parse_langfuse_timestamp(decoded) or (
+            now - timedelta(seconds=LANGFUSE_PULL_INTERVAL_SECONDS)
+        )
+
+    response = httpx.get(
+        f"{LANGFUSE_HOST.rstrip('/')}/api/public/observations",
+        params={"type": "GENERATION", "limit": 50, "startTime": last_check.isoformat()},
+        auth=(LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY),
+        timeout=20,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    observations = (
+        payload.get("data", payload) if isinstance(payload, dict) else payload
+    )
+    if not isinstance(observations, list):
+        observations = []
+
+    ingested = 0
+    with SessionLocal() as db:
+        for obs in observations:
+            if not isinstance(obs, dict):
+                continue
+            if (
+                str(obs.get("level") or "").upper() != "ERROR"
+                and obs.get("statusMessage") is None
+            ):
+                continue
+            obs_id = str(obs.get("id") or "").strip()
+            if not obs_id:
+                continue
+            event = schemas_module.EventIncoming(
+                source="langfuse",
+                service="langfuse",
+                severity=_severity_from_langfuse_observation(obs),
+                title=f"Langfuse: {obs.get('name', 'generation error')}",
+                message=str(obs.get("statusMessage") or obs.get("input") or "")[:5000],
+                payload_json=obs,
+                dedupe_key=f"langfuse:{obs_id}",
+                external_event_id=f"langfuse-{obs_id}",
+            )
+            main_module.ingest_event(event=event, db=db)
+            ingested += 1
+    redis_conn.set(prefixed_redis_key(LANGFUSE_PULL_CURSOR_KEY), now.isoformat())
+    return {
+        "status": "ok",
+        "fetched": len(observations),
+        "ingested": ingested,
+        "last_check": now.isoformat(),
+    }
+
+
 def _increment_metric_counter(prefix: str, channel: str, amount: int = 1) -> None:
     pipe = redis_conn.pipeline()
     pipe.hincrby(METRICS_REDIS_KEY, f"{prefix}:{channel}", amount)
@@ -1312,6 +1621,31 @@ def _send_notification_channel_impl(
                         "dedupe_key": dedupe_key,
                         "dedupe_window_seconds": dedupe_window_seconds,
                     }
+                service_rate_limit = _telegram_service_rate_limit_state(
+                    str(getattr(incident, "service", "") or "unknown")
+                )
+                if service_rate_limit["exceeded"]:
+                    _buffer_telegram_digest(incident, message_preview)
+                    _mark_notification_suppressed(
+                        db,
+                        notification_id,
+                        trace_id,
+                        channel_name,
+                        reason="service_rate_limit",
+                        dedupe_key=_telegram_service_rate_limit_key(
+                            str(getattr(incident, "service", "") or "unknown")
+                        ),
+                        dedupe_window_seconds=TELEGRAM_SERVICE_RATE_LIMIT_WINDOW_SECONDS,
+                        message_preview=message_preview,
+                        runbook_url=runbook_url,
+                    )
+                    return {
+                        "status": "suppressed_rate_limit",
+                        "channel": channel_name,
+                        "notification_id": notification_id,
+                        "trace_id": trace_id,
+                        "rate_limit": service_rate_limit,
+                    }
                 provider_id = _send_telegram_via_bot_api(
                     chat_id,
                     message_preview or "Alerta sem conteúdo.",
@@ -1596,6 +1930,21 @@ def _send_email_message_impl(notification_id: str, trace_id: str):
 @celery_app.task(name="oasis_radar_pull_worker")
 def oasis_radar_pull_worker(limit: int | None = None):
     return _pull_oasis_radar_impl(limit=limit)
+
+
+@celery_app.task(name="sentry_pull_worker")
+def sentry_pull_worker():
+    return _pull_sentry_impl()
+
+
+@celery_app.task(name="langfuse_pull_worker")
+def langfuse_pull_worker():
+    return _pull_langfuse_impl()
+
+
+@celery_app.task(name="telegram_digest_worker")
+def telegram_digest_worker():
+    return _send_telegram_digest_impl()
 
 
 # desabilitado temporariamente — sem oncall configurado

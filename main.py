@@ -9,6 +9,7 @@ from urllib.parse import urlencode
 from urllib.request import Request as UrlRequest, urlopen
 from urllib.error import URLError, HTTPError
 from datetime import datetime, timezone, timedelta
+from typing import Any
 from typing import cast as typing_cast, Literal as typing_Literal
 from fastapi import FastAPI, Depends, HTTPException, Request, Response, Query, Header
 from fastapi.exceptions import RequestValidationError
@@ -38,10 +39,8 @@ from .config import (
     SIGNALWIRE_PROJECT_ID,
     SIGNALWIRE_SPACE_URL,
     SENTRY_DSN,
-    SENTRY_WEBHOOK_SIGNING_SECRET,
     LANGFUSE_PUBLIC_KEY,
     LANGFUSE_SECRET_KEY,
-    LANGFUSE_WEBHOOK_SECRET,
     TWILIO_ACCOUNT_SID,
     TWILIO_AUTH_TOKEN,
     TWILIO_FROM_NUMBER,
@@ -59,6 +58,49 @@ from .config import (
 )
 
 VOICE_WEBHOOK_SECRET = os.environ.get("VOICE_WEBHOOK_SECRET")
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _incident_last_seen_at(incident: models.Incident) -> datetime | None:
+    return incident.updated_at or incident.created_at
+
+
+def _should_retrigger_incident(
+    incident: models.Incident,
+    previous_last_seen_at: datetime | None,
+) -> bool:
+    if incident.occurrences in {1, 10, 50, 100, 500}:
+        return True
+    if previous_last_seen_at is None:
+        return False
+    return (_utc_now() - previous_last_seen_at) > timedelta(hours=1)
+
+
+def _refresh_existing_incident(
+    incident: models.Incident,
+    event: schemas.EventIncoming,
+    *,
+    matched_rule: models.Rule | None,
+) -> dict[str, Any]:
+    previous_last_seen_at = _incident_last_seen_at(incident)
+    incident.occurrences = int(getattr(incident, "occurrences", 1) or 1) + 1
+    incident.severity = event.severity
+    incident.service = event.service
+    incident.title = event.title
+    incident.message = event.message
+    incident.payload_json = event.payload_json
+    incident.updated_at = _utc_now()
+    if matched_rule and incident.matched_rule_id is None:
+        incident.matched_rule_id = matched_rule.id
+    should_notify = _should_retrigger_incident(incident, previous_last_seen_at)
+    return {
+        "should_notify": should_notify,
+        "previous_last_seen_at": previous_last_seen_at,
+    }
+
 
 app = FastAPI(title="Event SaaS API", version="0.1.0")
 init_observability()
@@ -583,106 +625,6 @@ def _normalize_severity(level: object, default: str = "WARN") -> str:
     return default
 
 
-def _build_sentry_event(payload: dict[str, object]) -> schemas.EventIncoming:
-    event_name = _string_or_empty(
-        payload.get("action") or payload.get("event") or "issue"
-    )
-    level = payload.get("level") or payload.get("severity") or event_name
-    project = _string_or_empty(
-        payload.get("project") or payload.get("project_name") or "sentry"
-    )
-    culprit = _string_or_empty(
-        payload.get("culprit")
-        or payload.get("title")
-        or payload.get("message")
-        or "Sentry event"
-    )
-    issue_id = _string_or_empty(
-        payload.get("issue_id") or payload.get("id") or payload.get("event_id")
-    )
-    normalized_issue_id = (
-        issue_id
-        or hashlib.sha256(
-            json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
-        ).hexdigest()[:16]
-    )
-    issue_url = _string_or_empty(payload.get("url") or payload.get("web_url"))
-    title = f"Sentry {event_name}: {project}"
-    message_parts = [culprit]
-    if issue_url:
-        message_parts.append(issue_url)
-    return schemas.EventIncoming(
-        external_event_id=f"sentry:{normalized_issue_id}:{event_name.lower().replace(' ', '-')}",
-        source="sentry",
-        severity=_normalize_severity(level, default="ERROR"),
-        service=project,
-        title=title[:255],
-        message="\n".join(part for part in message_parts if part)[:5000],
-        payload_json=payload,
-        schedule_at=None,
-        dedupe_key=hashlib.sha256(
-            f"sentry|{project}|{event_name}|{culprit}".encode("utf-8")
-        ).hexdigest(),
-    )
-
-
-def _build_langfuse_event(payload: dict[str, object]) -> schemas.EventIncoming:
-    event_name = _string_or_empty(
-        payload.get("event") or payload.get("type") or "event"
-    )
-    project = _string_or_empty(
-        payload.get("project") or payload.get("project_id") or "langfuse"
-    )
-    trace_id = _string_or_empty(
-        payload.get("trace_id") or payload.get("id") or payload.get("object_id")
-    )
-    if not trace_id:
-        trace_id = hashlib.sha256(
-            json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
-        ).hexdigest()[:16]
-
-    level = payload.get("level") or payload.get("severity")
-    score_value = payload.get("score")
-    score_name = _string_or_empty(payload.get("score_name") or payload.get("name"))
-    trace_name = _string_or_empty(
-        payload.get("trace_name") or payload.get("observation_name")
-    )
-    message = _string_or_empty(
-        payload.get("message") or payload.get("status_message") or payload.get("error")
-    )
-
-    if level is None and isinstance(score_value, (int, float)):
-        level = "warn" if float(score_value) < 0.5 else "info"
-    if level is None and event_name.lower() in {"trace.error", "trace_failed", "error"}:
-        level = "error"
-
-    title_bits = ["Langfuse", event_name]
-    if score_name:
-        title_bits.append(score_name)
-    elif trace_name:
-        title_bits.append(trace_name)
-    title = " - ".join(bit for bit in title_bits if bit)
-
-    summary_parts = [part for part in [message, f"trace_id={trace_id}"] if part]
-    if isinstance(score_value, (int, float)):
-        summary_parts.append(f"score={float(score_value):.3f}")
-
-    dedupe_basis = (
-        f"langfuse|{project}|{event_name}|{trace_name}|{score_name}|{message}"
-    )
-    return schemas.EventIncoming(
-        external_event_id=f"langfuse:{trace_id}:{event_name.lower().replace(' ', '-')}",
-        source="langfuse",
-        severity=_normalize_severity(level, default="WARN"),
-        service=project,
-        title=title[:255],
-        message="\n".join(summary_parts)[:5000],
-        payload_json=payload,
-        schedule_at=None,
-        dedupe_key=hashlib.sha256(dedupe_basis.encode("utf-8")).hexdigest(),
-    )
-
-
 def _fetch_oasis_radar_entries(
     query: str,
     lookback_seconds: int,
@@ -965,6 +907,58 @@ def ingest_event(event: schemas.EventIncoming, db: Session = Depends(get_db)):
     effective_dedupe_key = event.dedupe_key or _build_rule_dedupe_key(
         event_dict, matched_rule
     )
+
+    existing_open_incident = None
+    if effective_dedupe_key:
+        existing_open_incident = (
+            db.query(models.Incident)
+            .filter(
+                models.Incident.dedupe_key == effective_dedupe_key,
+                models.Incident.status == models.IncidentStatus.OPEN,
+            )
+            .order_by(models.Incident.created_at.desc())
+            .first()
+        )
+
+    if existing_open_incident:
+        refresh_result = _refresh_existing_incident(
+            existing_open_incident,
+            event,
+            matched_rule=matched_rule,
+        )
+        db.add(
+            models.AuditLog(
+                trace_id=audit_trace_id,
+                incident_id=existing_open_incident.id,
+                action=models.AuditAction.EVENT_RECEIVED,
+                details_json={
+                    "payload": event_dict,
+                    "deduplicated_into_existing_incident": True,
+                    "occurrences": existing_open_incident.occurrences,
+                    "previous_last_seen_at": (
+                        refresh_result["previous_last_seen_at"].isoformat()
+                        if refresh_result["previous_last_seen_at"]
+                        else None
+                    ),
+                    "retriggered": refresh_result["should_notify"],
+                },
+            )
+        )
+        db.commit()
+
+        if matched_rule and refresh_result["should_notify"]:
+            dispatch_incident.apply_async(
+                args=(str(existing_open_incident.id), audit_trace_id),
+                queue=queue_name("dispatch"),
+            )
+        return schemas.EventIngestResponse(
+            status="accepted",
+            incident_id=existing_open_incident.id,
+            matched_rule=bool(matched_rule),
+            trace_id=audit_trace_id,
+            reason="deduplicated_into_existing_incident",
+        )
+
     if effective_dedupe_key and is_duplicate(f"dedupe:{effective_dedupe_key}"):
         db.add(
             models.AuditLog(
@@ -1008,6 +1002,7 @@ def ingest_event(event: schemas.EventIncoming, db: Session = Depends(get_db)):
         status=models.IncidentStatus.OPEN,
         matched_rule_id=matched_rule.id if matched_rule else None,
         dedupe_key=effective_dedupe_key,
+        occurrences=1,
     )
     db.add(incident)
     try:
@@ -1084,45 +1079,6 @@ def ingest_event(event: schemas.EventIncoming, db: Session = Depends(get_db)):
         matched_rule=bool(matched_rule),
         trace_id=audit_trace_id,
     )
-
-
-@app.post("/integrations/sentry/webhook", response_model=schemas.EventIngestResponse)
-async def sentry_webhook(request: Request, db: Session = Depends(get_db)):
-    raw_body = await request.body()
-    signature_ok, _signature_reason = _verify_json_webhook_signature(
-        raw_body,
-        request.headers.get("Sentry-Hook-Signature")
-        or request.headers.get("X-Sentry-Signature"),
-        SENTRY_WEBHOOK_SIGNING_SECRET,
-        header_prefix="sha256",
-    )
-    if not signature_ok:
-        raise HTTPException(status_code=401, detail="Invalid Sentry webhook signature")
-
-    payload = _coerce_payload_dict(await request.json())
-    event = _build_sentry_event(payload)
-    return ingest_event(event=event, db=db)
-
-
-@app.post("/integrations/langfuse/webhook", response_model=schemas.EventIngestResponse)
-async def langfuse_webhook(request: Request, db: Session = Depends(get_db)):
-    raw_body = await request.body()
-    signature_ok, _signature_reason = _verify_json_webhook_signature(
-        raw_body,
-        request.headers.get("X-Langfuse-Signature")
-        or request.headers.get("Langfuse-Signature")
-        or request.headers.get("X-Webhook-Signature"),
-        LANGFUSE_WEBHOOK_SECRET,
-        header_prefix="sha256",
-    )
-    if not signature_ok:
-        raise HTTPException(
-            status_code=401, detail="Invalid Langfuse webhook signature"
-        )
-
-    payload = _coerce_payload_dict(await request.json())
-    event = _build_langfuse_event(payload)
-    return ingest_event(event=event, db=db)
 
 
 @app.post("/integrations/oasis-radar/pull")

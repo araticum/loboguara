@@ -108,6 +108,18 @@ LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY", "")
 LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY", "")
 LANGFUSE_HOST = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
 LANGFUSE_WEBHOOK_SECRET = os.getenv("LANGFUSE_WEBHOOK_SECRET", "")
+SENTRY_PULL_ENABLED = os.getenv("SENTRY_PULL_ENABLED", "false").lower() == "true"
+SENTRY_API_TOKEN = os.getenv("SENTRY_API_TOKEN", "")
+SENTRY_ORG_SLUG = os.getenv("SENTRY_ORG_SLUG", "araticum")
+SENTRY_PULL_INTERVAL_SECONDS = int(os.getenv("SENTRY_PULL_INTERVAL_SECONDS", "60"))
+SENTRY_PULL_CURSOR_KEY = os.getenv(
+    "SENTRY_PULL_CURSOR_KEY", "integrations:sentry:last_seen_issue_id"
+)
+LANGFUSE_PULL_ENABLED = os.getenv("LANGFUSE_PULL_ENABLED", "false").lower() == "true"
+LANGFUSE_PULL_INTERVAL_SECONDS = int(os.getenv("LANGFUSE_PULL_INTERVAL_SECONDS", "120"))
+LANGFUSE_PULL_CURSOR_KEY = os.getenv(
+    "LANGFUSE_PULL_CURSOR_KEY", "integrations:langfuse:last_check_ts"
+)
 TELEGRAM_NOTIFICATION_DEDUPE_WINDOW_SECONDS = int(
     os.getenv("TELEGRAM_NOTIFICATION_DEDUPE_WINDOW_SECONDS", "300")
 )
